@@ -1,14 +1,3 @@
-## Personalizing Reinforcement Learning from Human Feedback with Variational Preference Learning
-
-####  [[Website]](https://weirdlabuw.github.io/vpl/) [[Paper]](https://arxiv.org/) 
-
-[Sriyash Poddar<sup>1</sup>](https://sriya.sh), [Yanming Wan<sup>1</sup>](https://yanmingwan.com/), [Hamish Ivison<sup>1</sup>](https://hamishivi.github.io/), [Abhishek Gupta<sup>1</sup>](https://homes.cs.washington.edu/~abhgupta), [Natasha Jaques<sup>1</sup>](https://natashajaques.ai)<br/>
-
-<sup>1</sup>University of Washington
-
-This repo is an implementation of the control experiments of VPL. VPL is a varitional framework for learning from human feedback (binary preference labels) i.e. inferring a novel user-specific latent and learning reward models and policies conditioned on this latent without additional user-specific data. This is used for quick adaptation to specific user preferences without retraining the entire model or ignoring underrepresented groups.
-
-## Instructions
 
 
 #### Setting up repo
@@ -85,15 +74,3 @@ bash run.sh VAE max
 
 This repository uses the IQL implementation in jax from https://github.com/dibyaghosh/jaxrl_m.
 
-
-## Bibtex
-If you find this code useful, please cite:
-
-```
-@article{poddar2024vpl,
-    author    = {Poddar, Sriyash and Wan, Yanming and Ivision, Hamish and Gupta, Abhishek and Jaques, Natasha},
-    title     = {Personalizing Reinforcement Learning from Human Feedback with Variational Preference Learning},
-    booktitle = {ArXiv Preprint},
-    year      = {2024},
-}
-```
