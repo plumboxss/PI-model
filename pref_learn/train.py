@@ -38,6 +38,10 @@ FLAGS_DEF = define_flags_with_default(
     model_type="MLP",  # can change
     # MLP
     hidden_dim=256,
+    # Attention Encoder
+    encoder_type='mlp', # 'mlp' or 'attention'
+    n_heads=4,
+    n_layers=2,
     # Categorical
     num_atoms=10,
     r_min=0,
@@ -123,6 +127,7 @@ def main(_):
         action_dim,
         FLAGS.batch_size,
         FLAGS.set_size,
+        FLAGS.encoder_type
     )
 
     if FLAGS.model_type == "MLP":
@@ -158,7 +163,7 @@ def main(_):
             reward_model = VAEModel
             decoder_input = obs_dim + FLAGS.latent_dim
         reward_model = reward_model(
-            encoder_input=len_set * (2 * observation_dim * len_query + 1),
+            encoder_input=obs_dim, # For attention, this is pair_dim, for mlp, flattened context
             decoder_input=decoder_input,
             latent_dim=FLAGS.latent_dim,
             hidden_dim=FLAGS.hidden_dim,
@@ -169,6 +174,9 @@ def main(_):
             flow_prior=FLAGS.flow_prior,
             annealer=annealer,
             reward_scaling=FLAGS.reward_scaling,
+            encoder_type=FLAGS.encoder_type,
+            n_heads=FLAGS.n_heads,
+            n_layers=FLAGS.n_layers,
         )
     elif FLAGS.model_type == "MLPClassifier":
         reward_model = MLPClassifier(obs_dim, FLAGS.hidden_dim)
@@ -185,11 +193,19 @@ def main(_):
         metrics["epoch"] = epoch
 
         for batch in train_loader:
-            optimizer.zero_grad()
-            observations = batch["observations"].to(device).float()
-            observations_2 = batch["observations_2"].to(device).float()
+            s1 = batch["s1"].to(device).float()
+            s2 = batch["s2"].to(device).float()
             labels = batch["labels"].to(device).float()
-            loss, batch_metrics = reward_model(observations, observations_2, labels)
+
+            if FLAGS.encoder_type == 'attention':
+                # For attention, the batch from GroupBatchSampler is (Batch=Context, 1, T, D)
+                # We need to reshape it to (1, Context, T, D) to treat the batch as one context
+                s1 = s1.unsqueeze(0)
+                s2 = s2.unsqueeze(0)
+                labels = labels.unsqueeze(0)
+            
+            optimizer.zero_grad()
+            loss, batch_metrics = reward_model(s1, s2, labels)
             loss.backward()
             optimizer.step()
 
@@ -199,11 +215,18 @@ def main(_):
         if epoch % FLAGS.eval_freq == 0:
             for batch in test_loader:
                 with torch.no_grad():
-                    observations = batch["observations"].to(device).float()
-                    observations_2 = batch["observations_2"].to(device).float()
+                    s1 = batch["s1"].to(device).float()
+                    s2 = batch["s2"].to(device).float()
                     labels = batch["labels"].to(device).float()
+
+                    if FLAGS.encoder_type == 'attention':
+                        # Same reshaping for evaluation
+                        s1 = s1.unsqueeze(0)
+                        s2 = s2.unsqueeze(0)
+                        labels = labels.unsqueeze(0)
+
                     loss, batch_metrics = reward_model(
-                        observations, observations_2, labels
+                        s1, s2, labels
                     )
 
                     for key, val in prefix_metrics(batch_metrics, "eval").items():

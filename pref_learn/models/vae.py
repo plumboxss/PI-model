@@ -32,6 +32,47 @@ class Encoder(nn.Module):
         return mean, log_var
 
 
+class SelfAttentionEncoder(nn.Module):
+    def __init__(self, pair_dim, hidden_dim, latent_dim, n_heads=4, n_layers=2):
+        super(SelfAttentionEncoder, self).__init__()
+        
+        # 1. Individual pair embedding layer
+        self.pair_embed = nn.Sequential(
+            nn.Linear(pair_dim, hidden_dim),
+            nn.LeakyReLU(0.2),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+        # 2. Transformer Encoder to process the sequence of pairs
+        encoder_layer = nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=n_heads, dim_feedforward=hidden_dim*4, batch_first=True)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+
+        # 3. Output layers
+        self.output_mlp = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LeakyReLU(0.2)
+        )
+        self.FC_mean = nn.Linear(hidden_dim, latent_dim)
+        self.FC_var = nn.Linear(hidden_dim, latent_dim)
+
+    def forward(self, x): # Expected input shape: (batch_size, seq_len, pair_dim)
+        # 1. Embed each pair in the sequence
+        embeddings = self.pair_embed(x) # (B, S, H)
+
+        # 2. Process sequence with transformer
+        transformer_out = self.transformer_encoder(embeddings) # (B, S, H)
+
+        # 3. Aggregate sequence information (mean pooling)
+        aggregated = transformer_out.mean(dim=1) # (B, H)
+        
+        # 4. Final MLP and output heads
+        h_ = self.output_mlp(aggregated)
+        mean = self.FC_mean(h_)
+        log_var = self.FC_var(h_)
+
+        return mean, log_var
+
+
 class Decoder(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim):
         super(Decoder, self).__init__()
@@ -64,9 +105,25 @@ class VAEModel(nn.Module):
         flow_prior=False,
         annealer=None,
         reward_scaling=1.0,
+        encoder_type='mlp',
+        n_heads=4,
+        n_layers=2,
     ):
         super(VAEModel, self).__init__()
-        self.Encoder = Encoder(encoder_input, hidden_dim, latent_dim)
+        self.encoder_type = encoder_type
+        if self.encoder_type == 'attention':
+            # For attention, encoder_input is the dimension of ONE pair
+            self.Encoder = SelfAttentionEncoder(
+                pair_dim=encoder_input,
+                hidden_dim=hidden_dim,
+                latent_dim=latent_dim,
+                n_heads=n_heads,
+                n_layers=n_layers
+            )
+        else: # Default to original MLP encoder
+            # For MLP, encoder_input is the flattened dimension of ALL pairs in context
+            self.Encoder = Encoder(encoder_input, hidden_dim, latent_dim)
+
         self.Decoder = Decoder(decoder_input, hidden_dim, 1)
         self.latent_dim = latent_dim
         self.mean = torch.nn.Parameter(
@@ -93,13 +150,23 @@ class VAEModel(nn.Module):
         return z
 
     def encode(self, s1, s2, y):
+        # s1, s2 shape for MLP: (B, Ann_size, T, State)
+        # s1, s2 shape for Attention: (B, Context_len, T, State)
+        
         s1_ = s1.view(s1.shape[0], s1.shape[1], -1)
         s2_ = s2.view(s2.shape[0], s2.shape[1], -1)
-        y = y.reshape(s1.shape[0], s1.shape[1], -1)
+        y_ = y.view(y.shape[0], y.shape[1], -1)
 
-        encoder_input = torch.cat([s1_, s2_, y], dim=-1).view(
-            s1.shape[0], -1
-        )  # Batch x Ann x (2*T*State + 1)
+        # Shape of pair_data is (B, Context_len, Pair_dim)
+        pair_data = torch.cat([s1_, s2_, y_], dim=-1)
+
+        if self.encoder_type == 'attention':
+            # Input is already in the correct shape for SelfAttentionEncoder
+            encoder_input = pair_data
+        else: # Original MLP logic
+            # Flatten the sequence dimension for MLP
+            encoder_input = pair_data.view(s1.shape[0], -1)
+
         mean, log_var = self.Encoder(encoder_input)
         return mean, log_var
 
@@ -147,17 +214,33 @@ class VAEModel(nn.Module):
         else:
             z = self.reparameterization(mean, torch.exp(0.5 * log_var))  # Batch x Z
             log_det = None
-        z = z.repeat((1, self.annotation_size * self.size_segment)).view(
-            -1, self.annotation_size, self.size_segment, z.shape[1]
-        )
+        
+        # When using attention encoder, z is (B, Z). For decoder, it needs to be broadcasted.
+        # When using MLP encoder, z is (B, Z), but context was flattened.
+        # The number of segments to decode over is s1.shape[1] (annotation/context size) * s1.shape[2] (traj length)
+        # This broadcasting logic seems complex and might need adjustment based on data loader.
+        # Let's assume the data loader for attention gives (B, C, T, D) and z is (B, Z).
+        # We need z to become (B, C, T, Z) for decoding.
+        
+        num_contexts = s1.shape[0] # B
+        context_len = s1.shape[1]  # C
+        traj_len = s1.shape[2]     # T
 
-        r0 = self.decode(s1, z)
-        r1 = self.decode(s2, z)
+        # Reshape z from (B, Z) to (B, 1, 1, Z) and then expand
+        z_expanded = z.unsqueeze(1).unsqueeze(1).expand(num_contexts, context_len, traj_len, self.latent_dim)
+
+        r0 = self.decode(s1, z_expanded)
+        r1 = self.decode(s2, z_expanded)
 
         r_hat1 = r0.sum(axis=2) / self.scaling
         r_hat2 = r1.sum(axis=2) / self.scaling
 
-        p_hat = torch.nn.functional.sigmoid(r_hat1 - r_hat2).view(-1, 1)
+        p_hat = torch.nn.functional.sigmoid(r_hat1 - r_hat2)
+        
+        # The loss should be calculated per pair in the context
+        # p_hat is (B, C, 1), y is (B, C, 1)
+        # We need to calculate loss over all pairs in all contexts
+        p_hat = p_hat.view(-1, 1)
         labels = y.view(-1, 1)
 
         reconstruction_loss = self.reconstruction_loss(labels, p_hat)
@@ -212,6 +295,9 @@ class VAEClassifier(VAEModel):
         flow_prior=False,
         annealer=None,
         reward_scaling=1.0,
+        encoder_type='mlp', # Pass through
+        n_heads=4,
+        n_layers=2,
     ):
         super(VAEClassifier, self).__init__(
             encoder_input,
@@ -225,6 +311,9 @@ class VAEClassifier(VAEModel):
             flow_prior,
             annealer,
             reward_scaling,
+            encoder_type,     # Pass through
+            n_heads,
+            n_layers,
         )
 
     def forward(self, s1, s2, y):  # Batch x Ann x T x State, Batch x Ann x 1
@@ -236,11 +325,14 @@ class VAEClassifier(VAEModel):
         else:
             z = self.reparameterization(mean, torch.exp(0.5 * log_var))  # Batch x Z
             log_det = None
-        z = z.repeat((1, self.annotation_size * self.size_segment)).view(
-            -1, self.annotation_size, self.size_segment, z.shape[1]
-        )
 
-        p_hat = self.Decoder(torch.cat([s1, s2, z], dim=-1)).view(-1, 1)
+        # Broadcasting z for classifier decoder
+        num_contexts = s1.shape[0] # B
+        context_len = s1.shape[1]  # C
+        traj_len = s1.shape[2]     # T
+        z_expanded = z.unsqueeze(1).unsqueeze(1).expand(num_contexts, context_len, traj_len, self.latent_dim)
+
+        p_hat = self.Decoder(torch.cat([s1, s2, z_expanded], dim=-1))
         p_hat = torch.nn.functional.sigmoid(p_hat).view(-1, 1)
         labels = y.view(-1, 1)
 

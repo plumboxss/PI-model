@@ -1,0 +1,14 @@
+simul_1:
+  controller: "p_add_lowpass"
+  wrapper: "basic_obs"
+  rl: ["ppo_basic", "sac_basic"]
+
+simul_2:
+  controller: "p_add_lowpass"
+  wrapper: "basic_obs"
+  rl: ["sac_basic"]
+
+test:
+  controller: "p_add_lowpass"
+  wrapper: "basic_obs"
+  rl: ["sac_basic", "ppo_basic"]

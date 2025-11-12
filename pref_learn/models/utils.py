@@ -4,93 +4,190 @@ import pickle
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.data.sampler import Sampler
 
 from pref_learn.utils.data_utils import get_labels
 
 
-def get_datasets(query_path, observation_dim, action_dim, batch_size, set_length):
-    with open(query_path, "rb") as fp:
-        batch = pickle.load(fp)
+def get_datasets(
+    dataset_path, observation_dim, action_dim, batch_size, set_size, encoder_type='mlp'
+):
+    with open(dataset_path, "rb") as f:
+        dataset = pickle.load(f)
 
-    batch["observations"] = batch["observations"][..., :observation_dim]
-    batch["observations_2"] = batch["observations_2"][..., :observation_dim]
-    assert batch["actions"].shape[-1] == action_dim
-    if set_length < 0:
-        set_length = batch["observations"].shape[1]
+    # For VPL, observations are already (obs, action) concatenated
+    # In our case, we need to handle obs and actions separately
+    obs_dim = dataset["observations"].shape[-1]
+    act_dim = dataset["actions"].shape[-1]
+    input_dim = obs_dim + act_dim
+
+    # The original VPL code reshapes the dataset based on set_size (context length).
+    # Let's see if our dataset is already in the right format.
+    # Our data format: (Num_Pairs, 1, Traj_len, Dim)
+    # VPL expected: (Num_Queries, Pairs_per_query, Traj_len, Dim)
+    # We can treat Num_Pairs as Num_Queries and Pairs_per_query as 1 for MLP.
+    # For Attention, we need to group them.
+
+    model_ids = dataset.get('model_id')
+
+    train_dataset = PreferenceDataset(dataset, model_ids, train=True)
+    eval_dataset = PreferenceDataset(dataset, model_ids, train=False)
     
-    eval_data_size = int(0.1 * len(batch["observations"]))
-    train_data_size = len(batch["observations"]) - eval_data_size
+    if encoder_type == 'attention':
+        # For attention, we group by model_id to form batches.
+        # set_size here will be the context length, which is determined by the sampler.
+        # We need a collate_fn to stack the pairs into a context.
+        
+        # The sampler will provide indices for a batch. The default collate_fn
+        # will stack them, resulting in (Batch, 1, Traj, Dim).
+        # We need to reshape this for the attention encoder.
+        # Let's adjust the loader and train script instead.
+        # The sampler is the most important part.
 
-    train_batch = {
-        "observations": batch["observations"][:train_data_size, :set_length],
-        "actions": batch["actions"][:train_data_size, :set_length],
-        "observations_2": batch["observations_2"][:train_data_size, :set_length],
-        "actions_2": batch["actions_2"][:train_data_size, :set_length],
-        "labels": batch["labels"][:train_data_size, :set_length],
-    }
+        train_sampler = GroupBatchSampler(train_dataset.model_ids, batch_size)
+        train_loader = DataLoader(
+            train_dataset, batch_sampler=train_sampler, num_workers=4
+        )
+        
+        # For evaluation, we can still shuffle normally
+        eval_loader = DataLoader(
+            eval_dataset, batch_size=batch_size, shuffle=True, num_workers=4
+        )
+        
+        # For attention encoder, pair_dim = Traj_len * (Obs+Act) + 1
+        traj_len = dataset['observations'].shape[2]
+        pair_dim = traj_len * input_dim * 2 + 1 
+        # But our SelfAttentionEncoder expects one pair at a time... let's rethink.
+        # The input to SelfAttentionEncoder is (B, S, pair_dim)
+        # where S is seq_len (context size) and pair_dim is flattened (s1,s2,y)
+        # The data loader should yield batches of shape (B, S, D) where B is num_contexts
+        # and S is context_len. This is complex.
 
-    eval_batch = {
-        "observations": batch["observations"][train_data_size:, :set_length],
-        "actions": batch["actions"][train_data_size:, :set_length],
-        "observations_2": batch["observations_2"][train_data_size:, :set_length],
-        "actions_2": batch["actions_2"][train_data_size:, :set_length],
-        "labels": batch["labels"][train_data_size:, :set_length],
-    }
+        # Let's simplify:
+        # 1. The Sampler ensures a batch has ONE model_id.
+        # 2. The default collate_fn creates a batch: (Batch_size, 1, T, D) for obs/act
+        # 3. In the train script, we treat this Batch_size as the context length.
+        #    We will need to unsqueeze(0) to create a batch of 1 context.
+        # This seems like the most straightforward change.
+        # get_datasets will just return the loader with the GroupBatchSampler.
+        
+        # We also need to define the input dimension for the encoder.
+        # The SelfAttentionEncoder embeds each pair. The pair dim is flattened s1, s2, label
+        s1_dim = dataset['observations'].shape[2] * input_dim
+        pair_dim_for_attn = s1_dim * 2 + 1
+        
+        # The original `set_size` is not used in this path.
+        # len_set = batch_size, len_query = 1
+        return train_loader, eval_loader, train_dataset, eval_dataset, batch_size, 1, pair_dim_for_attn
 
-    train_dataset = PreferenceDataset(train_batch)
-    eval_dataset = PreferenceDataset(eval_batch)
-    kwargs = {"num_workers": 1, "pin_memory": True}
-    train_loader = DataLoader(
-        dataset=train_dataset, batch_size=batch_size, shuffle=True, **kwargs
-    )
-    test_loader = DataLoader(
-        dataset=eval_dataset, batch_size=batch_size, shuffle=False, **kwargs
-    )
+    else: # Original MLP path
+        num_queries_train = train_dataset.num_queries
+        num_queries_test = eval_dataset.num_queries
+        len_set = dataset["observations"].shape[1]
+        len_query = 1
 
-    _, _, len_query, obs_dim = batch["observations"].shape
-    return (
-        train_loader,
-        test_loader,
-        train_dataset,
-        eval_dataset,
-        set_length,
-        len_query,
-        obs_dim,
-    )
+        dataset_obs_dim = dataset["observations"].shape[-1]
+        assert (
+            dataset_obs_dim == observation_dim + action_dim
+        ), "Wrong observation dimension"
+
+        train_loader = DataLoader(
+            train_dataset, batch_size=batch_size, shuffle=True, num_workers=4
+        )
+        eval_loader = DataLoader(
+            eval_dataset, batch_size=batch_size, shuffle=False, num_workers=4
+        )
+
+        return (
+            train_loader,
+            eval_loader,
+            train_dataset,
+            eval_dataset,
+            len_set,
+            len_query,
+            dataset_obs_dim,
+        )
 
 
 class PreferenceDataset(Dataset):
-    def __init__(self, pref_dataset):
+    def __init__(self, pref_dataset, model_ids, train=True):
         self.pref_dataset = pref_dataset
+        self.model_ids = model_ids
+        self.train = train
+        self.num_queries = self.pref_dataset["observations"].shape[0]
+        self.num_total_pairs_per_query = self.pref_dataset["observations"].shape[1]
 
     def __len__(self):
-        return len(self.pref_dataset["observations"])
+        return self.num_queries
 
-    def __getitem__(self, idx):
-        observations = self.pref_dataset["observations"][idx]
-        observations_2 = self.pref_dataset["observations_2"][idx]
-        labels = self.pref_dataset["labels"][idx]
-        return dict(
-            observations=observations, observations_2=observations_2, labels=labels
-        )
+    def __getitem__(self, query_idx):
+        # In VPL, annotation size is the number of pairs per query.
+        # For our case, it's the context length.
+        num_pairs = self.num_total_pairs_per_query
+        
+        obs1 = self.pref_dataset["observations"][query_idx, :num_pairs]
+        obs2 = self.pref_dataset["observations_2"][query_idx, :num_pairs]
+        actions1 = self.pref_dataset["actions"][query_idx, :num_pairs]
+        actions2 = self.pref_dataset["actions_2"][query_idx, :num_pairs]
+        
+        # We need to combine obs and actions to match original VPL input dim
+        # obs: (Context, Traj, Dim), actions: (Context, Traj, Dim)
+        # -> (Context, Traj, Obs_dim + Act_dim)
+        s1 = np.concatenate([obs1, actions1], axis=-1)
+        s2 = np.concatenate([obs2, actions2], axis=-1)
+        
+        labels = self.pref_dataset["labels"][query_idx, :num_pairs]
+        model_id = self.model_ids[query_idx] if self.model_ids is not None else -1
 
-    def get_mode_data(self, batch_size):
-        batch_size = min(batch_size, len(self))
-        idxs = np.random.choice(range(len(self)), size=batch_size, replace=False)
-        return dict(
-            observations=self.pref_dataset["observations"][idxs],
-            observations_2=self.pref_dataset["observations_2"][idxs],
-        ), batch_size
+        return {
+            "s1": s1,
+            "s2": s2,
+            "labels": labels,
+            "model_id": model_id
+        }
+
+
+class GroupBatchSampler(Sampler):
+    """
+    Custom sampler to ensure each batch contains data from only one user group (model_id).
+    """
+    def __init__(self, model_ids, batch_size):
+        self.model_ids = model_ids
+        self.batch_size = batch_size
+        
+        # Group indices by model_id
+        self.indices_by_group = {}
+        for idx, model_id in enumerate(model_ids):
+            if model_id not in self.indices_by_group:
+                self.indices_by_group[model_id] = []
+            self.indices_by_group[model_id].append(idx)
+        
+        self.groups = list(self.indices_by_group.keys())
+        self.num_batches = len(model_ids) // batch_size
+
+    def __iter__(self):
+        for _ in range(self.num_batches):
+            # 1. Randomly select a user group
+            group_id = np.random.choice(self.groups)
+            
+            # 2. Sample a batch of indices from that group
+            group_indices = self.indices_by_group[group_id]
+            batch_indices = np.random.choice(group_indices, self.batch_size, replace=False)
+            
+            yield batch_indices
+
+    def __len__(self):
+        return self.num_batches
 
 
 class Annealer:
-    def __init__(self, total_steps, shape, baseline=0.0, cyclical=False, disable=False):
+    def __init__(self, total_steps, shape="cosine", baseline=0.0, cyclical=False):
         self.total_steps = total_steps
         self.current_step = 0
         self.cyclical = cyclical
         self.shape = shape
         self.baseline = baseline
-        if disable:
+        if self.shape == "none":
             self.shape = "none"
             self.baseline = 0.0
 
@@ -102,7 +199,7 @@ class Annealer:
         if self.shape == "linear":
             y = self.current_step / self.total_steps
         elif self.shape == "cosine":
-            y = (math.cos(math.pi * (self.current_step / self.total_steps - 1)) + 1) / 2
+            y = (1 - np.cos(self.current_step * np.pi / self.total_steps)) / 2
         elif self.shape == "logistic":
             exponent = (self.total_steps / 2) - self.current_step
             y = 1 / (1 + math.exp(exponent))
