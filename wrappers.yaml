@@ -1,8 +1,0 @@
-basic_obs:
-  obs_keys: ["theta", "dtheta", "ddtheta", "dx_com", "ddx_com", "dz_com"]
-obs7:
-  obs_keys: ["theta", "dtheta", "ddtheta", "dx_com", "ddx_com", "dz_com", "ddz_com"]
-obs8:
-  obs_keys: ["theta", "dtheta", "ddtheta", "dx_com", "ddx_com", "dddx_com", "dz_com", "ddz_com"]
-minimal_obs:
-  obs_keys: ["theta", "dtheta", "ddtheta", "dx_com", "ddx_com"]

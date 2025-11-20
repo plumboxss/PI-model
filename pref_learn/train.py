@@ -18,12 +18,14 @@ from pref_learn.utils.utils import (
 from pref_learn.models.utils import get_datasets, Annealer, EarlyStopper
 from pref_learn.models.vae import VAEModel
 import pref_learn.utils.plot_utils as putils
+from src.env import SingleScenarioEnv
 
 FLAGS_DEF = define_flags_with_default(
-    env="maze2d-target-v0",  # can change
-    comment="",
-    data_seed=42,
+    seed=42,
+    # env_name='HalfCheetah-v2',
+    max_steps=int(2e5),
     batch_size=256,
+    log_interval=1000,
     set_size=-1,
     early_stop=False,
     min_delta=3e-4,
@@ -85,7 +87,7 @@ def main(_):
     FLAGS.logging.output_dir = save_dir
     wb_logger = WandBLogger(FLAGS.logging, variant=variant)
 
-    gym_env = gym.make(FLAGS.env)
+    gym_env = SingleScenarioEnv()
     gym_env.seed(FLAGS.seed)
     gym_env.action_space.seed(FLAGS.seed)
     gym_env.observation_space.seed(FLAGS.seed)

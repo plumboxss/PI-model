@@ -6,7 +6,10 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.sampler import Sampler
 
-from pref_learn.utils.data_utils import get_labels
+from collections import defaultdict
+import torch
+from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
 
 
 def get_datasets(
@@ -256,31 +259,6 @@ class EarlyStopper:
             if self.counter >= self.patience:
                 return True
         return False
-
-
-def get_latent(batch, env, reward_model, mode, num_samples):
-    # obs_dim = env.reward_observation_space.shape[0]
-    obs1 = batch["observations"]
-    obs2 = batch["observations_2"]
-    obs_dim = obs1.shape[-1]
-    seg_reward_1 = env.compute_reward(obs1.reshape(-1, reward_model.size_segment, obs_dim), mode)
-    seg_reward_2 = env.compute_reward(obs2.reshape(-1, reward_model.size_segment, obs_dim), mode)
-
-    seg_reward_1 = seg_reward_1.reshape(
-        num_samples, reward_model.annotation_size, reward_model.size_segment, -1
-    )
-    seg_reward_2 = seg_reward_2.reshape(
-        num_samples, reward_model.annotation_size, reward_model.size_segment, -1
-    )
-
-    labels = get_labels(seg_reward_1, seg_reward_2)
-    device = next(reward_model.parameters()).device
-    obs1 = torch.from_numpy(obs1).float().to(device)
-    obs2 = torch.from_numpy(obs2).float().to(device)
-    labels = torch.from_numpy(labels).float().to(device)
-    with torch.no_grad():
-        mean, _ = reward_model.encode(obs1, obs2, labels)
-    return mean.cpu().numpy()
 
 
 def get_posterior(env, reward_model, dataset, mode, num_samples):
