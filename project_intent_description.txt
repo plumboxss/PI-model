@@ -1,0 +1,458 @@
+
+## 1. High-level goal
+
+The goal of this project is to learn a **preference-conditioned reward model** and a **latent user embedding model** so that we can:
+
+1. Learn a reward function r_φ(s, a, z) that maps a **state–action pair** and a **latent preference vector** z to a **scalar reward**.
+2. Learn an encoder q_ψ(z | c) = N(μ, Σ) that, given a set of preference comparisons c from a single annotator (or user), produces a **Gaussian posterior distribution** over that user’s latent preference z.
+3. For a new task (or new user), **infer an appropriate latent preference vector** z_new (e.g., by taking Z_new = μ_new) and use it to adapt the control policy or reward.
+
+In short:
+
+- r_φ(s, a, z) = scalar reward
+- q_ψ(z | c) = N(μ, Σ)
+- Z_new = μ_new is the adapted latent vector for a new task / new preference context.
+
+The final objective is to support **fast adaptation**: given a few preference queries from a new setting, we want to quickly infer the corresponding z and use it to guide control or evaluation.
+
+---
+
+## 2. Data and models we need
+
+### 2.1 Preference data
+
+We assume a dataset of **pairwise preference annotations**:
+
+D = { (σ_i^A, σ_i^B, y_i) }_{i=1}^N
+
+- Each tuple is a pair of trajectories (σ_i^A, σ_i^B) and a label y_i ∈ {0, 1} (or potentially {0, 1} with soft/probabilistic variants later).
+- These annotations come from a human annotator h. When needed, we can group data by annotator:
+  D_h = { (σ_i^A, σ_i^B, y_i) }_{i=1}^{N_h}
+
+For each annotator h, their **context** is:
+
+c_h = { (σ_i^A, σ_i^B, y_i) }_{i=1}^{N_h}
+
+This context c_h is the input to the encoder q_ψ(z | c_h).
+
+---
+
+### 2.2 Reward model r_φ(s, a, z)
+
+- **Type**: Neural network reward model parameterized by φ.
+- **Input**:
+  - s_t: state at time t
+    - Includes: vehicle speed, acceleration, jerk, pitch, yaw, and other sensor-based or kinematic features.
+  - a_t: action (e.g., control torque) at time t.
+  - z: latent preference vector (dimension d ∈ {8, 16, 32}, or later reduced to 4D for visualization).
+
+We concatenate:
+
+x_t = s_t ⊕ a_t ⊕ z
+
+- **Architecture (baseline)**:
+  - MLP with 2 hidden layers.
+  - Hidden size: 256 units per layer.
+  - Nonlinearity: standard choice (e.g., ReLU).
+- **Output**:
+  - Scalar instantaneous reward:
+    r_φ(s_t, a_t, z) ∈ R
+
+Later, trajectory-level scores are computed by summing or averaging over time.
+
+---
+
+### 2.3 Encoder E / q_ψ(z | c)
+
+We define an encoder network E_ψ that outputs a **Gaussian posterior**:
+
+q_ψ(z | c) = N(μ(c), Σ(c))
+
+- **Input**: A batch of pairwise preference data from the **same annotator** h.  
+  For a given context:
+  c_h = { (σ_i^A, σ_i^B, y_i) }_{i=1}^N
+
+  where σ_i^A, σ_i^B are trajectory segments and y_i is the preference label.
+
+We design the encoder in **two conceptual stages**:
+
+---
+
+#### A. Trajectory embedding
+
+For each trajectory σ, we first obtain a trajectory-level embedding. Two possible approaches:
+
+1. **Hand-crafted features**:  
+   - Extract scalar features per trajectory:
+     - Average jerk, maximum jerk,
+     - Maximum pitch, pitch variation,
+     - Settling time, etc.
+   - This yields an embedding e(σ) (e.g., a small vector of engineered features).
+
+2. **Learned features via the reward model or self-attention**:
+   - Use early layers of r_φ(s, a, z) (without conditioning on a specific z) or a separate encoder to produce embeddings.
+   - Alternatively, use a self-attention-based encoder over states/actions of the trajectory.
+
+For each comparison pair (σ_i^A, σ_i^B, y_i), we obtain embeddings:
+
+e_A = e(σ_i^A),   e_B = e(σ_i^B)
+
+Then we build a **pair-encoder** (a small network) that produces a “feedback vector” h_i:
+
+h_i = PairEncoder(e_A, e_B, y_i)
+
+- PairEncoder can be implemented as:
+  - Concatenation of e_A, e_B and y_i (or one-hot encoding of the label),
+  - Followed by a 2-layer MLP.
+- Output: h_i ∈ R^{d_h}, a compact summary of a single preference comparison.
+
+---
+
+#### B. Permutation-invariant set aggregation
+
+We now have a set of feedback vectors:
+
+{ h_i }_{i=1}^N
+
+We need to aggregate this set in a **permutation-invariant** manner into a single latent representation for the annotator.
+
+We use **self-attention layers** to perform this aggregation:
+
+- Inputs: sequence (set) { h_i }_{i=1}^N
+- Architecture: multi-head self-attention encoder (e.g., Transformer encoder blocks).
+- Effect: models interaction between different comparisons and extracts a global representation of the annotator’s preferences.
+
+From the final self-attention output, we pool (e.g., via mean pooling, CLS token, or similar) to obtain a global context embedding, then map it to Gaussian parameters:
+
+(μ, Σ) = f_head({ h_i }_{i=1}^N)
+
+- Output:
+  - Mean vector μ ∈ R^d
+  - Covariance (or diagonal covariance) Σ ∈ R^{d × d}
+- Latent dimension d can be 8, 16, 32, etc.
+- Prior over z:
+  p(z) = N(0, I)
+
+---
+
+## 3. Data generation (simulation)
+
+We use a **car simulation environment** (suspension control task) to generate trajectories.
+
+### A. Trajectory generation
+
+- We vary the **controller parameters**, especially the **P gain** of the controller.
+- For each chosen P gain (and possibly other gains/parameters), we:
+  1. Run the vehicle over a road profile with bumps/disturbances.
+  2. Log the resulting trajectory σ:
+     - States over time (velocity, acceleration, jerk, pitch, yaw, etc.).
+     - Actions (control torques).
+- This gives us a pool of trajectories under different control settings.
+
+The question “how to deal with disturbances?” is left open at this stage. Initially, we focus on variations induced by different control gains. Later, we can incorporate disturbances or noise for robustness testing.
+
+---
+
+### B. Labeling and testing (two main methods)
+
+The **MVP** (minimum viable product) focuses on whether the model can **adapt to new tasks** via z, even if labels are synthetic. Real human preferences are not strictly required in the first stage.
+
+We consider **two labeling strategies**:
+
+---
+
+### Method A: Feature-based unsupervised clustering + rule-based preferences
+
+1. **Feature extraction**:  
+   For each trajectory, compute scalar features:
+   - Average jerk,
+   - Maximum jerk,
+   - Settling time,
+   - Maximum pitch, etc.
+
+2. **Unsupervised clustering**:
+   - Use these features to cluster trajectories into several groups.
+   - Based on these groups, define **feature-based preference patterns**, e.g.:
+     - Group 1: prefers low jerk, high pitch.
+     - Group 2: prefers high jerk, low pitch.
+
+   This effectively defines **latent user groups** in feature space.
+
+3. **Preference definition**:
+   - For each feature, define preference labels ∈ {0, 1}.
+   - For example, a label vector:
+     [0, 1, 1, 1, 1, 0]
+     could encode which features are preferred or not.
+   - Then define the overall trajectory preference as “higher average of preferred features”.
+
+4. **Pairwise comparison data**:
+   - Generate pairwise comparisons where the “more preferred” trajectory receives label 1.
+   - This allows **smooth preference modeling** from “very preferred” to “very non-preferred” based on feature differences.
+
+5. **Single-comparison (strong label) data**:
+   - For each feature or feature combination, define:
+     - Trajectories above a threshold (e.g., mean > 0.7) as strongly preferred (label 1).
+     - Others as 0.
+   - These can provide “strong signals” for training the reward model.
+
+**Test metric** (Method A):  
+After N preference queries and adaptation, roll out with the learned control parameters and measure how often the resulting trajectories fall into the **desired preference region** (according to the feature-based criteria of the new task).
+
+---
+
+### Method B: Classifier-based partition of trajectory space
+
+1. **Train a classifier** over trajectories:
+   - The classifier splits the space into different regions, analogous to different “preference modes”.
+   - This region structure in feature space is similar in spirit to the z-space partition.
+
+2. **Use self-attention architecture**:
+   - Ideally, reuse the self-attention layers from the encoder architecture (or something compatible) so the classifier and encoder share representational structure.
+
+3. **Pairwise comparison data**:
+   - Option 1: Construct comparisons only across “preferred vs non-preferred” regions and assign label 1 to the preferred region.
+   - Option 2: Define a distance-based score L_D in feature space:
+     - If a trajectory is closer to the preferred region, assign label 1.
+     - If closer to non-preferred region, assign label 0.
+
+4. **Single-comparison data**:
+   - For each region, assign label 1 to the preferred region and 0 to others.
+
+**Test metric** (Method B):  
+After N queries and adaptation, roll out using the adapted control parameters, pass the resulting trajectories through the classifier, and evaluate how often they are classified into the **target preference region**.
+
+---
+
+## 4. Pre-training procedure
+
+We pre-train **both**:
+
+- The encoder E_ψ (which outputs μ, Σ),
+- The reward model R_φ ≡ r_φ(s, a, z),
+
+using preference data before running interactive adaptation.
+
+### Step 1: Sampling
+
+Repeat until training converges:
+
+1. Sample mini-batches B from the dataset D.
+2. Each batch is drawn from a **single annotator** h to represent a coherent context c_h:
+   B = { (σ_i^A, σ_i^B, y_i) }_{i=1}^{N_B}
+
+---
+
+### Step 2: Encoding
+
+Use the encoder E_ψ to compute the **posterior parameters**:
+
+(μ_B, Σ_B) = E_ψ(B)
+
+This yields a Gaussian:
+
+q_ψ(z | B) = N(μ_B, Σ_B)
+
+---
+
+### Step 3: Latent sampling
+
+Sample z ~ N(μ_B, Σ_B) using the reparameterization trick.
+
+---
+
+### Step 4: Reward computation and Bradley–Terry-like preference model
+
+For each trajectory in the pair:
+
+- Compute the (summed) reward under z:
+
+R_φ(σ^1, z) = Σ_t r_φ(s_t^1, a_t^1, z)
+R_φ(σ^2, z) = Σ_t r_φ(s_t^2, a_t^2, z)
+
+We then define a preference probability:
+
+P_φ(σ^1 ≻ σ^2 | z)
+= exp(R_φ(σ^1, z)) / (exp(R_φ(σ^1, z)) + exp(R_φ(σ^2, z)))
+
+This is a **conditional BTL-style model** (Bradley–Terry–Luce) conditioned on z.
+
+---
+
+### Step 5: Losses (BCE + KL)
+
+We use:
+
+- **Cross-entropy loss** L_BCE between the model’s predicted preference and the true label y.
+- **KL regularization** term L_KL between the posterior and the prior p(z) = N(0, I):
+
+L_KL = β · D_KL(N(μ_B, Σ_B) || N(0, I))
+
+The weight β is **cosine annealed** over training (e.g., every 25% of training steps, following a cosine schedule) to gradually strengthen the regularization.
+
+The **total loss** is:
+
+L_total = L_BCE + L_KL
+
+We update both the encoder parameters ψ and reward parameters φ via gradient descent.
+
+---
+
+## 5. Reward normalization via comparison set C
+
+After training r_φ, we want a **normalized reward** that behaves like a “reference-point–aware utility”, similar to ideas in HALO / Prospect Theory.
+
+We define a **comparison set**:
+
+1. Sample a set of states (or segments) from the offline dataset:
+   C = { s_1, s_2, …, s_{|C|} }
+   This set is chosen to be representative (expressive) of the data distribution.
+
+2. Sample z from the posterior for the user (or use a representative z).
+
+3. For a given state s_t, define the **scaled normalized reward**:
+
+r_φ(s_t, a_t, z) = (1 / |C|) Σ_{s' ∈ C} p_φ(s_t ≻ s' | z)
+
+where p_φ(s_t ≻ s' | z) is the probability that state s_t is preferred over s', induced by the learned reward model and preference structure.
+
+This yields:
+
+- r_φ(s_t, a_t, z) ∈ [0, 1],
+- Interpreted as the **expected likelihood** that s_t is preferred over a random state from C.
+
+4. We augment the dataset to include these normalized rewards:
+
+(s_t, a_t, r_t, z)
+
+for each time step t. Here r_t is the normalized reward defined above.
+
+This augmented dataset can then be used to train **RL policies** conditioned on z.
+
+During adaptation, we also define trajectory-level scores:
+
+R(σ, z_current) = (1 / S) Σ_{t=1}^S r_φ(s_t, a_t, z_current)
+
+where S is the length (in time steps) of the trajectory. This is used to select informative comparison pairs.
+
+---
+
+## 6. Adaptation phase (interactive)
+
+During adaptation, we interactively update the user’s latent vector z based on new queries.
+
+### Step 1: Query trajectory σ_A
+
+- We sample a controller parameter (e.g., P gain) from the **same set of gains** used in pretraining, to ensure we stay within the valid dynamics regime.
+- We roll out the simulation with this controller to get σ_A.
+
+### Step 2: Select implicit comparison trajectory σ_B
+
+We want to choose σ_B such that:
+
+1. The preference model is **maximally uncertain** about whether σ_A is preferred, i.e.:
+
+   P(σ_B ≻ σ_A | z_μ) ≈ 0.5 ± ε
+
+   where z_μ is the current mean of the posterior z, and ε is a small margin.
+
+2. There is a **minimum distinguishability** in terms of jerk:
+
+   ΔJerk ≥ δ
+
+   so that, even for a human, the two trajectories are meaningfully different. The idea is that we avoid asking the human to label two nearly indistinguishable trajectories, which would produce noisy labels.
+
+This selection σ_B is called an **implicit comparison**. It is chosen so that:
+
+- It is informative (uncertain, around probability 0.5),
+- Yet distinguishable (constraints on jerk difference).
+
+### Step 3: Update context and re-encode
+
+- We obtain a new label y from the human (or from simulation of the label in MVP).
+- We add (σ_A, σ_B, y) to the context c.
+- We re-run the encoder q_ψ(z | c) to obtain updated (μ_new, Σ_new), and thus an updated z.
+
+This loop is repeated for N queries. At each step, z becomes more aligned with the given task or user preference.
+
+---
+
+## 7. Why target probability 0.5? Connection to HALO and reference points
+
+We interpret our normalized reward and preference model via **HALO (Human-Aware Losses)** and **Prospect Theory**.
+
+In HALO:
+
+- Human value v(r_0 | x,y) is defined in terms of:
+  - A “raw reward” r_0(x, y), and
+  - A **reference distribution** Q(Y | x), capturing the expected outcome over alternative decisions.
+
+The value is often expressed in terms of:
+
+v(r_0(x, y) - E_Q[r_0(x, Y)])
+
+- Here, the reference point is E_Q[r_0(x, Y)].
+
+In our case:
+
+- x = (s, a),
+- y = σ (trajectory or state outcome),
+- The comparison set C plays the role of Q(Y | x),
+- Our normalized reward:
+
+  r_t = (1 / |C|) Σ_{s' ∈ C} p_φ(s_t ≻ s' | z)
+
+  is exactly the **expected likelihood** of being preferred to elements of the comparison set.
+
+Interpretation:
+
+- C serves as the **reference distribution** of outcomes.
+- r_t is a **reference-point–normalized** measure of utility for s_t relative to C.
+- A value around r_t = 0.5 can be interpreted as being “at the reference point” (neither clearly better nor clearly worse than typical states in C).
+
+Therefore:
+
+- When we choose comparisons such that the model’s predicted preference is around 0.5 ± ε, we are effectively querying near the **reference point** of each user’s value function.
+- This aligns with HALO’s idea of modeling human preferences around reference points (Prospect Theory: humans evaluate gains/losses relative to a reference, not in absolute terms).
+
+Thus, for each user, a normalized reward near 0.5 is analogous to being near their **reference point** z_0, and querying around this region is both informative and theoretically grounded.
+
+---
+
+## 8. Visualization of z-space
+
+To analyze training stability and adaptation behavior, we can reduce the latent dimension to d = 4 for tests:
+
+- Use 4-dimensional z for certain experiments.
+- Visualize the distribution of z (e.g., using scatter plots, PCA/TSNE of higher-d embeddings).
+- Observe how **clusters** of user/task preferences form and how adaptation moves z within this space.
+
+This helps diagnose:
+
+- Mode collapse or instability,
+- Whether different synthetic users/tasks occupy distinct regions in z-space.
+
+---
+
+## 9. Summary
+
+This project builds a **preference-conditioned reward model** and **latent user encoder** for vehicle suspension control:
+
+- **Reward model** r_φ(s, a, z):  
+  MLP that outputs scalar instantaneous reward, conditioned on state, action, and latent preference vector.
+
+- **Encoder** q_ψ(z | c) = N(μ, Σ):  
+  Self-attention-based permutation-invariant encoder over sets of preference comparisons, mapping them to a latent preference distribution.
+
+- **Pre-training**:  
+  Uses conditional BTL-style preference modeling with BCE + KL loss (with cosine-annealed β).
+
+- **Reward normalization**:  
+  Uses comparison set C to define a HALO-consistent, reference-point–normalized reward in [0, 1].
+
+- **Adaptation**:  
+  Interactive selection of informative trajectory pairs, targeting P(σ_B ≻ σ_A | z_μ) ≈ 0.5 ± ε with constraints on jerk differences to avoid noisy labels, followed by re-encoding z.
+
+- **Label generation (MVP)**:  
+  Initially uses synthetic labels via feature-based or classifier-based strategies (Methods A and B), without requiring real human labels, to test representation power and adaptation.
+
+The core intent is to create a system that can **learn diverse preference styles as latent codes** and **quickly adapt** to new tasks or users by updating these latent codes via a small number of preference queries.

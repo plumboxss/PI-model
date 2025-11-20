@@ -12,100 +12,149 @@ import sys
 sys.path.append(os.getcwd())
 from pref_learn.models.vae import VAEModel
 
-def calculate_state_rewards(states_b, z, comparison_set_C, vae_model):
+def calculate_state_rewards(states_b, actions_b, z, comparison_set_C_obs, comparison_set_C_act, vae_model):
     """
-    Calculates the normalized reward for a batch of states.
+    상태(state)들의 보상을 계산하는 함수
     r(s,z) = 1/|C| * sum_{s' in C} P(s > s' | z)
+    여기서 s는 상태, z는 잠재 변수, C는 비교 세트
+    P(s > s' | z)는 상태 s가 상태 s'보다 더 좋은 확률
     """
     with torch.no_grad():
-        T = states_b.shape[0] # Number of states in the batch
-        N = comparison_set_C.shape[0] # Size of the comparison set
+        T = states_b.shape[0] # 배치의 상태 수
+        N = comparison_set_C_obs.shape[0] # 비교 세트의 크기
         
-        # Prepare tensors for batch computation
-        # Repeat states to compare against each element in C: (T, N, D)
+        # 배치 계산을 위한 텐서 준비
+        # C의 각 요소와 비교하기 위해 상태 반복: (T, N, D_obs)
         states_b_rpt = states_b.unsqueeze(1).repeat(1, N, 1)
-        # Repeat C for each state in the batch: (T, N, D)
-        C_rpt = comparison_set_C.unsqueeze(0).repeat(T, 1, 1)
-        # Repeat z for all comparisons: (T * N, Z)
+        actions_b_rpt = actions_b.unsqueeze(1).repeat(1, N, 1)
+        # 배치의 각 상태에 대해 C 반복: (T, N, D_obs), (T, N, D_act)
+        C_obs_rpt = comparison_set_C_obs.unsqueeze(0).repeat(T, 1, 1)
+        C_act_rpt = comparison_set_C_act.unsqueeze(0).repeat(T, 1, 1)
+        # 모든 비교에 대해 z 반복: (T * N, Z)
         z_rpt = z.repeat(T * N, 1)
 
-        # Flatten for model input
+        # 모델 입력을 위해 평탄화
         states_flat = states_b_rpt.view(T * N, -1)
-        C_flat = C_rpt.view(T * N, -1)
+        actions_flat = actions_b_rpt.view(T * N, -1)
+        C_obs_flat = C_obs_rpt.view(T * N, -1)
+        C_act_flat = C_act_rpt.view(T * N, -1)
 
-        # Get raw reward scores from the VAE decoder
-        r_states = vae_model.decode(states_flat, z_rpt)
-        r_C = vae_model.decode(C_flat, z_rpt)
+        # VAE 모델을 사용하여 상태와 비교 세트의 보상을 계산
+        r_states = vae_model.decode(states_flat, actions_flat, z_rpt)
+        r_C = vae_model.decode(C_obs_flat, C_act_flat, z_rpt)
 
-        # Calculate preference probabilities P(s > s' | z)
+        # 선호도 확률 P(s > s' | z) 계산
         probs_flat = torch.sigmoid(r_states - r_C)
         
-        # Reshape to (T, N) to average over N
+        # (T, N) 형태로 변환하여 N에 대해 평균 계산
         probs = probs_flat.view(T, N)
         
-        # The normalized reward for each state is the mean of these probabilities
+        # 각 상태의 정규화된 보상은 이러한 확률의 평균
         state_rewards = probs.mean(dim=1) # Shape: (T,)
     
     return state_rewards
 
-def create_trajectory_scorer(z_current, vae_model, comparison_set_C):
+def create_trajectory_scorer(z_current, vae_model, comparison_set_C_obs, comparison_set_C_act):
     """
-    Creates a function that scores a trajectory based on the average normalized reward of its states.
+    궤적(trajectory)의 점수를 계산하는 함수를 생성
+    궤적의 상태들의 평균 정규화된 보상을 기반으로 함
     R(sigma, z) = 1/|sigma| * sum_{s in sigma} r(s,z)
+    여기서 sigma는 궤적, z는 잠재 변수, r(s,z)는 상태 s에 대한 보상
     """
     device = next(vae_model.parameters()).device
 
     def trajectory_scorer(trajectory):
-        # Extract observations and move to the correct device
+        # 관측값(observations)과 행동(actions) 추출 및 장치로 이동
         obs_np = trajectory['observations']
+        act_np = trajectory['actions']
         obs_tensor = torch.from_numpy(obs_np).float().to(device)
+        act_tensor = torch.from_numpy(act_np).float().to(device)
 
-        # Calculate normalized rewards for all states in the trajectory
-        state_rewards = calculate_state_rewards(obs_tensor, z_current, comparison_set_C, vae_model)
+        # 궤적의 모든 상태에 대해 정규화된 보상 계산
+        state_rewards = calculate_state_rewards(obs_tensor, act_tensor, z_current, comparison_set_C_obs, comparison_set_C_act, vae_model)
         
-        # The trajectory score is the mean of its state rewards
+        # 궤적의 점수는 상태 보상의 평균
         return state_rewards.mean().item()
 
     return trajectory_scorer
 
 
-def find_implicit_pair(input_traj, input_traj_features, trajectory_scorer, 
+def find_implicit_pair(input_traj, input_traj_features, z_current, vae_model,
                        trajectories, features_matrix, epsilon=0.1, search_sample_size=500):
     """
-    Finds the best implicit trajectory to form a preference pair.
+    현재 z를 기준으로, 가장 정보량이 많은 암시적 궤적을 찾아 선호 쌍을 형성합니다.
+    이 함수는 다음 두 가지 조건을 만족하는 후보 궤적을 찾습니다:
+    1. 다양성 조건: 입력 궤적과 평균 Jerk 차이가 epsilon 이상이어야 합니다.
+    2. 불확실성 조건: P(후보 ≻ 입력 | z)가 0.5에 가장 가까워야 합니다.
+
+    Args:
+        input_traj (dict): 사용자가 제공한 입력 궤적.
+        input_traj_features (np.array): 입력 궤적의 특징 벡터.
+        z_current (torch.Tensor): 현재 잠재 벡터.
+        vae_model (VAEModel): 사전 훈련된 VAE 모델.
+        trajectories (list): 전체 궤적 데이터셋.
+        features_matrix (np.array): 전체 궤적에 대한 특징 매트릭스.
+        epsilon (float): 다양성 필터링을 위한 최소 특징 차이 임계값.
+        search_sample_size (int): 검색 효율을 위해 탐색할 궤적의 샘플 크기.
+
+    Returns:
+        dict: 찾은 최적의 암시적 궤적.
     """
-    # For efficiency, we search over a random subset of the dataset
+    device = next(vae_model.parameters()).device
+    
+    # 입력 궤적 준비
+    obs_in_np = input_traj['observations']
+    act_in_np = input_traj['actions']
+    obs_in = torch.from_numpy(obs_in_np).float().to(device)
+    act_in = torch.from_numpy(act_in_np).float().to(device)
+
+    # 검색을 위한 무작위 하위 집합 선택
     search_indices = np.random.choice(len(trajectories), search_sample_size, replace=False)
     
     best_candidate_idx = -1
     min_uncertainty_score = float('inf')
 
-    # Calculate the score for the input trajectory once
-    score_input = trajectory_scorer(input_traj)
-
-    for idx in tqdm(search_indices, desc="Finding implicit pair", leave=False):
-        candidate_traj = trajectories[idx]
-        candidate_features = features_matrix[idx]
-        
-        # 1. Check diversity condition (using avg_jerk: feature index 0)
-        diversity_score = np.abs(input_traj_features[0] - candidate_features[0])
-        if diversity_score < epsilon:
-            continue
+    with torch.no_grad():
+        # 모든 후보 궤적에 대해 반복
+        for idx in tqdm(search_indices, desc="Finding implicit pair", leave=False):
+            candidate_traj = trajectories[idx]
+            candidate_features = features_matrix[idx]
             
-        # 2. Calculate uncertainty using the trajectory scorer
-        score_candidate = trajectory_scorer(candidate_traj)
-        
-        # Calculate preference probability P(input > candidate) using trajectory scores
-        prob_input_gt_cand = 1 / (1 + np.exp(-(score_input - score_candidate)))
+            # 조건 1: 다양성 확보 (평균 Jerk 차이)
+            diversity_score = np.abs(input_traj_features[0] - candidate_features[0])
+            if diversity_score < epsilon:
+                continue
+                
+            # 후보 궤적 준비
+            obs_cand_np = candidate_traj['observations']
+            act_cand_np = candidate_traj['actions']
 
-        uncertainty_score = abs(prob_input_gt_cand - 0.5)
-        
-        if uncertainty_score < min_uncertainty_score:
-            min_uncertainty_score = uncertainty_score
-            best_candidate_idx = idx
+            # 궤적 길이를 동일하게 맞춤 (짧은 쪽 기준)
+            min_len = min(obs_in.shape[0], obs_cand_np.shape[0])
+            obs_in_trunc = obs_in[:min_len]
+            act_in_trunc = act_in[:min_len]
+            obs_cand = torch.from_numpy(obs_cand_np[:min_len]).float().to(device)
+            act_cand = torch.from_numpy(act_cand_np[:min_len]).float().to(device)
+
+            # z를 궤적 길이에 맞게 확장
+            z_expanded = z_current.repeat(min_len, 1)
+
+            # 조건 2: 불확실성이 가장 높은 쌍 선택 (P ≈ 0.5)
+            # 각 궤적의 총 보상 계산
+            r_in = vae_model.decode(obs_in_trunc, act_in_trunc, z_expanded).sum()
+            r_cand = vae_model.decode(obs_cand, act_cand, z_expanded).sum()
+            
+            # 선호도 확률 계산: P(후보 > 입력 | z)
+            prob = torch.sigmoid(r_cand - r_in).item()
+            
+            uncertainty_score = abs(prob - 0.5)
+            
+            if uncertainty_score < min_uncertainty_score:
+                min_uncertainty_score = uncertainty_score
+                best_candidate_idx = idx
 
     if best_candidate_idx == -1:
-        print("Warning: No diverse enough trajectory found. Returning a random one.")
+        print("경고: 충분히 다양한 궤적을 찾을 수 없습니다. 무작위 궤적을 반환합니다.")
         random_idx = np.random.choice(len(trajectories))
         return trajectories[random_idx]
         
@@ -116,14 +165,14 @@ class AdaptationLoop:
     def __init__(self, args):
         self.args = args
         
-        # 1. Load pretrained VAE model
+        # 1. 사전 훈련된 VAE 모델 로드
         print("Loading pretrained VAE model...")
         self.vae_model = torch.load(args.vae_model_path)
         self.vae_model.eval()
         self.device = next(self.vae_model.parameters()).device
         print("Model loaded successfully.")
 
-        # 2. Load full trajectory dataset and create the fixed comparison set C
+        # 2. 전체 궤적 데이터셋 로드 및 고정 비교 세트 C 생성
         print("Loading trajectory dataset...")
         with open(args.trajectory_dataset_path, 'rb') as f:
             raw_data = pickle.load(f)
@@ -131,104 +180,92 @@ class AdaptationLoop:
         self.trajectories = []
         self.features_list = []
         all_states_list = []
+        all_actions_list = []
         for i in sorted(raw_data.keys()):
             res = raw_data[i]
             if res.get('features'):
                 self.trajectories.append({'observations': res['state'], 'actions': res['action']})
                 self.features_list.append(np.array(list(res['features'].values())))
                 all_states_list.append(res['state'])
+                all_actions_list.append(res['action'])
 
         self.features_matrix = np.array(self.features_list)
         all_states = np.concatenate(all_states_list, axis=0)
+        all_actions = np.concatenate(all_actions_list, axis=0)
         print(f"Loaded {len(self.trajectories)} trajectories and {len(all_states)} total states.")
 
-        # Create the fixed comparison set C by sampling states
+        # 상태 및 행동 샘플링을 통해 고정 비교 세트 C 생성
         print(f"Creating fixed comparison set C with size {args.comparison_set_size}...")
         comparison_indices = np.random.choice(len(all_states), args.comparison_set_size, replace=False)
-        self.comparison_set_C = torch.from_numpy(all_states[comparison_indices]).float().to(self.device)
+        self.comparison_set_C_obs = torch.from_numpy(all_states[comparison_indices]).float().to(self.device)
+        self.comparison_set_C_act = torch.from_numpy(all_actions[comparison_indices]).float().to(self.device)
 
-        # 3. Initialize z and context
+        # 3. z 및 컨텍스트 초기화
         self.z_current = torch.randn(1, self.vae_model.latent_dim, device=self.device)
         self.context = [] # List to store (traj1_obs, traj2_obs, label)
         print(f"Initialized z with shape: {self.z_current.shape}")
 
 
     def step(self, input_traj, input_traj_features, input_label):
-        """Performs one step of the adaptation loop."""
+        """어댑테이션 루프의 한 단계를 수행"""
         print(f"\n--- Step {len(self.context) + 1} ---")
         
-        # 1. Create the trajectory scorer function based on the current z and fixed set C
-        print("1. Creating trajectory scorer for current z...")
-        trajectory_scorer = create_trajectory_scorer(self.z_current, self.vae_model, self.comparison_set_C)
-
-        # 2. Find implicit pair
-        print("2. Searching for an implicit pair...")
-        implicit_traj = find_implicit_pair(input_traj, input_traj_features, trajectory_scorer, self.trajectories, self.features_matrix, epsilon=self.args.diversity_epsilon)
+        # 1. 암시적 쌍 찾기 (이제 trajectory_scorer가 필요 없음)
+        print("1. Searching for an implicit pair...")
+        implicit_traj = find_implicit_pair(input_traj, input_traj_features, self.z_current, self.vae_model, self.trajectories, self.features_matrix, epsilon=self.args.diversity_epsilon)
         print("Implicit pair found.")
 
-        # 3. Update context
-        # Assuming input_label=1 means input_traj is preferred
+        # 2. Update context
+        # input_label=1은 input_traj가 선호됨을 의미
         if input_label == 1:
-            self.context.append((input_traj['observations'], implicit_traj['observations'], 1.0))
+            self.context.append((input_traj, implicit_traj, 1.0))
         else:
-            self.context.append((implicit_traj['observations'], input_traj['observations'], 1.0))
-        print(f"3. Context updated. Current context size: {len(self.context)}")
+            self.context.append((implicit_traj, input_traj, 1.0))
+        print(f"2. Context updated. Current context size: {len(self.context)}")
 
-        # 4. Re-infer z using the entire context
-        print("4. Re-inferring z from the updated context...")
+        # 3. 전체 컨텍스트를 사용하여 z 재추정
+        print("3. Re-inferring z from the updated context...")
         
-        # Prepare the whole context as a single batch for the attention encoder
-        obs1_list, obs2_list, labels_list = zip(*self.context)
+        # 전체 컨텍스트를 단일 배치로 준비하여 어텐션 인코더에 전달
+        trajs1_list, trajs2_list, labels_list = zip(*self.context)
         
-        # Find the minimum trajectory length in the context for padding/truncating
-        min_len_obs1 = min(o.shape[0] for o in obs1_list)
-        min_len_obs2 = min(o.shape[0] for o in obs2_list)
+        # 컨텍스트에서 최소 궤적 길이를 찾아 패딩/자르기
+        min_len_obs1 = min(t['observations'].shape[0] for t in trajs1_list)
+        min_len_obs2 = min(t['observations'].shape[0] for t in trajs2_list)
         min_len = min(min_len_obs1, min_len_obs2)
 
-        # Truncate all trajectories to the minimum length and stack
-        obs1_batch = np.array([o[:min_len] for o in obs1_list])
-        obs2_batch = np.array([o[:min_len] for o in obs2_list])
+        # 모든 궤적을 최소 길이로 자르고 스택
+        obs1_batch = np.array([t['observations'][:min_len] for t in trajs1_list])
+        obs2_batch = np.array([t['observations'][:min_len] for t in trajs2_list])
+        actions1_batch = np.array([t['actions'][:min_len] for t in trajs1_list])
+        actions2_batch = np.array([t['actions'][:min_len] for t in trajs2_list])
         labels_batch = np.array(labels_list)
 
-        # Add a batch dimension (for a single context) and a pair dimension
-        obs1_tensor = torch.from_numpy(obs1_batch).float().to(self.device).unsqueeze(1)
-        obs2_tensor = torch.from_numpy(obs2_batch).float().to(self.device).unsqueeze(1)
+        # s1/s2는 obs+act를 결합해야 함
+        s1_batch = np.concatenate([obs1_batch, actions1_batch], axis=-1)
+        s2_batch = np.concatenate([obs2_batch, actions2_batch], axis=-1)
+
+        # 배치 차원(단일 컨텍스트) 및 쌍 차원 추가
+        s1_tensor = torch.from_numpy(s1_batch).float().to(self.device).unsqueeze(0)
+        s2_tensor = torch.from_numpy(s2_batch).float().to(self.device).unsqueeze(0)
         labels_tensor = torch.from_numpy(labels_batch).float().to(self.device).view(1, -1, 1)
 
-        # Now we need to handle the fact that s1/s2 are obs+act.
-        # Let's assume actions are zeros for now as we don't have them for adaptation.
-        # This needs to be consistent with how the pretraining dataset was built.
-        # Our dataset combines obs+act inside the PreferenceDataset class.
-        # So the vae_model.encode expects concatenated obs+act. Let's create dummy actions.
-        
-        dummy_actions1 = torch.zeros_like(obs1_tensor[..., :1]) # Assuming action dim is 1
-        dummy_actions2 = torch.zeros_like(obs2_tensor[..., :1])
-
-        s1_context = torch.cat([obs1_tensor, dummy_actions1], dim=-1)
-        s2_context = torch.cat([obs2_tensor, dummy_actions2], dim=-1)
-
-        # The shape should be (B, C, T, D) -> (1, Context_len, T, D)
-        # Reshape to (1, num_pairs, traj_len, obs_dim+act_dim)
-        context_len = len(self.context)
-        s1_context = s1_context.view(1, context_len, min_len, -1)
-        s2_context = s2_context.view(1, context_len, min_len, -1)
-
         with torch.no_grad():
-            mean, log_var = self.vae_model.encode(s1_context, s2_context, labels_tensor)
+            mean, log_var = self.vae_model.encode(s1_tensor, s2_tensor, labels_tensor)
             self.z_current = self.vae_model.reparameterization(mean, torch.exp(0.5 * log_var))
         
         print(f"z re-inferred successfully. New z mean: {mean.mean().item():.4f}")
         return self.z_current
 
     def run(self):
-        """Runs the interactive adaptation session."""
+        """어댑테이션 세션을 실행"""
         print("\nStarting interactive adaptation loop.")
         print("In each step, provide a trajectory and your preference (1 for good, 0 for bad).")
         
-        # In a real scenario, this loop would be driven by external inputs.
-        # Here, we simulate it with a few dummy inputs.
-        for i in range(3): # Simulate 3 steps of feedback
-            # Dummy input: just pick a random trajectory from the dataset
+        # 실제 시나리오에서는 외부 입력에 의해 이루어짐.
+        # 여기서는 몇 가지 더미 입력을 사용하여 시뮬레이션.
+        for i in range(3): # 3 단계의 피드백 시뮬레이션
+            # 더미 입력: 데이터셋에서 무작위 궤적 선택
             dummy_input_idx = np.random.randint(len(self.trajectories))
             dummy_input_traj = self.trajectories[dummy_input_idx]
             dummy_input_features = self.features_matrix[dummy_input_idx]
@@ -241,7 +278,7 @@ class AdaptationLoop:
         print("Final z (mean of distribution):")
         print(self.z_current)
 
-        # Save the final z
+        # 최종 z 저장
         output_path = self.args.output_z_path
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         torch.save(self.z_current, output_path)
@@ -249,17 +286,17 @@ class AdaptationLoop:
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Run interactive adaptation to find a user's latent preference z.")
-    parser.add_argument('--vae_model_path', type=str, required=True, help='Path to the pretrained VAE model (.pt file).')
-    parser.add_argument('--trajectory_dataset_path', type=str, required=True, help='Path to the raw trajectory dataset (.pkl file).')
-    parser.add_argument('--output_z_path', type=str, default='data/adapted_z.pt', help='Path to save the final adapted z vector.')
-    parser.add_argument('--comparison_set_size', type=int, default=1000, help='Number of states for the fixed comparison set C.')
-    parser.add_argument('--diversity_epsilon', type=float, default=0.1, help='Minimum feature difference for a diverse pair.')
+    parser = argparse.ArgumentParser(description="어댑테이션 세션을 실행하여 사용자의 잠재 선호 z를 찾습니다.")
+    parser.add_argument('--vae_model_path', type=str, required=True, help='사전 훈련된 VAE 모델 경로 (.pt 파일).')
+    parser.add_argument('--trajectory_dataset_path', type=str, required=True, help='궤적 데이터셋 경로 (.pkl 파일).')
+    parser.add_argument('--output_z_path', type=str, default='data/adapted_z.pt', help='최종 어댑트된 z 벡터 저장 경로.')
+    parser.add_argument('--comparison_set_size', type=int, default=1000, help='고정 비교 세트 C의 상태 수.')
+    parser.add_argument('--diversity_epsilon', type=float, default=0.1, help='다양한 쌍을 위한 최소 특성 차이.')
 
     args = parser.parse_args()
     
-    # Example usage (requires a trained model and a dataset):
-    # python experiments/run_interactive_adaptation.py --vae_model_path logs/my_model/best_model.pt --trajectory_dataset_path artifacts/A/datasets/raw_trajectories.pkl
+    # 예제 사용 (학습된 모델과 데이터셋이 필요함):
+    # python experiments/run_interactive_adaptation.py --vae_model_path logs/maze2d-twogoals-multimodal-v0/VAE/vae/s0/best_model.pt --trajectory_dataset_path pref_datasets/maze2d-twogoals-multimodal-v0/relabelled_queries_num5000_q1_s16/raw_trajectories.pkl
     
     loop = AdaptationLoop(args)
     loop.run()

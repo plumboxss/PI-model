@@ -30,8 +30,11 @@ def get_datasets(
 
     model_ids = dataset.get('model_id')
 
-    train_dataset = PreferenceDataset(dataset, model_ids, train=True)
-    eval_dataset = PreferenceDataset(dataset, model_ids, train=False)
+    # action_dim을 PreferenceDataset에 전달하기 위해 데이터셋에서 직접 추출합니다.
+    act_dim = dataset["actions"].shape[-1]
+
+    train_dataset = PreferenceDataset(dataset, act_dim, model_ids, train=True)
+    eval_dataset = PreferenceDataset(dataset, act_dim, model_ids, train=False)
     
     if encoder_type == 'attention':
         # For attention, we group by model_id to form batches.
@@ -73,7 +76,8 @@ def get_datasets(
         
         # We also need to define the input dimension for the encoder.
         # The SelfAttentionEncoder embeds each pair. The pair dim is flattened s1, s2, label
-        s1_dim = dataset['observations'].shape[2] * input_dim
+        # s1, s2는 이제 obs, act가 합쳐진 형태이므로 input_dim을 사용합니다.
+        s1_dim = dataset['observations'].shape[2] * (dataset['observations'].shape[3] + act_dim)
         pair_dim_for_attn = s1_dim * 2 + 1
         
         # The original `set_size` is not used in this path.
@@ -86,10 +90,9 @@ def get_datasets(
         len_set = dataset["observations"].shape[1]
         len_query = 1
 
-        dataset_obs_dim = dataset["observations"].shape[-1]
-        assert (
-            dataset_obs_dim == observation_dim + action_dim
-        ), "Wrong observation dimension"
+        # MLP 경로는 더 이상 사용되지 않으므로, obs_dim 계산을 Attention 경로와 유사하게 맞춥니다.
+        # 이 부분은 train.py에서 MLP 로직이 제거되면 함께 정리될 수 있습니다.
+        dataset_obs_dim = (dataset["observations"].shape[-1] + act_dim) * dataset["observations"].shape[2]
 
         train_loader = DataLoader(
             train_dataset, batch_size=batch_size, shuffle=True, num_workers=4
@@ -110,8 +113,9 @@ def get_datasets(
 
 
 class PreferenceDataset(Dataset):
-    def __init__(self, pref_dataset, model_ids, train=True):
+    def __init__(self, pref_dataset, action_dim, model_ids, train=True):
         self.pref_dataset = pref_dataset
+        self.action_dim = action_dim
         self.model_ids = model_ids
         self.train = train
         self.num_queries = self.pref_dataset["observations"].shape[0]
@@ -130,18 +134,21 @@ class PreferenceDataset(Dataset):
         actions1 = self.pref_dataset["actions"][query_idx, :num_pairs]
         actions2 = self.pref_dataset["actions_2"][query_idx, :num_pairs]
         
-        # We need to combine obs and actions to match original VPL input dim
-        # obs: (Context, Traj, Dim), actions: (Context, Traj, Dim)
-        # -> (Context, Traj, Obs_dim + Act_dim)
-        s1 = np.concatenate([obs1, actions1], axis=-1)
-        s2 = np.concatenate([obs2, actions2], axis=-1)
-        
         labels = self.pref_dataset["labels"][query_idx, :num_pairs]
         model_id = self.model_ids[query_idx] if self.model_ids is not None else -1
+
+        # encoder 입력을 위해 obs와 action을 합치되,
+        # decoder를 위해 원본 obs와 action도 별도로 반환합니다.
+        s1 = np.concatenate([obs1, actions1], axis=-1)
+        s2 = np.concatenate([obs2, actions2], axis=-1)
 
         return {
             "s1": s1,
             "s2": s2,
+            "obs1": obs1,
+            "act1": actions1,
+            "obs2": obs2,
+            "act2": actions2,
             "labels": labels,
             "model_id": model_id
         }

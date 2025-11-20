@@ -11,9 +11,8 @@ ACCEL_KEYS = ["ddz_com", "ddtheta", "ddz_us_f", "ddz_us_r", "ddx_com"]
 JERK_KEYS = ["dddz_com", "dddtheta", "dddz_us_f", "dddz_us_r", "dddx_com"]
 
 class SuspensionEnv(gymnasium.Env):
-    def __init__(self, human_controller=None, is_multi_bump=False):
+    def __init__(self, human_controller=None):
         super().__init__()
-        self.is_multi_bump = is_multi_bump
 
         self.obs_keys = ["theta", "dtheta", "ddtheta", "dx_com", "ddx_com", "dz_com"]
 
@@ -23,7 +22,7 @@ class SuspensionEnv(gymnasium.Env):
         self.human_controller = human_controller if human_controller is not None else HumanController()
         self.config = Environment_Parameters()
         self.vehicle_params = Vehicle_Parameters()
-        self.bump = Bump(is_multi_bump=self.is_multi_bump)
+        self.bump = Bump()
         self.vehicle = compile_vehicle_model(self.vehicle_params)
 
         self.x0 = np.array(self.config.x0, dtype=np.float32)
@@ -152,9 +151,11 @@ class SuspensionEnv(gymnasium.Env):
         }
 
     def _get_reward(self):
-        pitch_rate = self.state["dtheta"]
-        pitch_penalty = - (pitch_rate * 5) ** 2
-        return pitch_penalty
+        # 이 프로젝트의 학습 방식에서는 환경 자체의 보상은 사용되지 않으므로 0.0을 반환합니다.
+        # pitch_rate = self.state["dtheta"]
+        # pitch_penalty = - (pitch_rate * 5) ** 2
+        # return pitch_penalty
+        return 0.0
 
     def detect_bump(self, x, u, z):
         x_pred = self.vehicle(x, u, z=[0, 0]).copy()
@@ -170,7 +171,7 @@ class SuspensionEnv(gymnasium.Env):
 
 class SingleScenarioEnv(SuspensionEnv):
     def __init__(self, human_controller=None):
-        super().__init__(human_controller=human_controller, is_multi_bump=False)
+        super().__init__(human_controller=human_controller)
 
         self.t_observe    = self.config.t_observe
         self.observe_step = int(self.t_observe / self.config.dt_inner)

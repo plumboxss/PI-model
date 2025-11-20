@@ -16,13 +16,7 @@ from pref_learn.utils.utils import (
     prefix_metrics,
 )
 from pref_learn.models.utils import get_datasets, Annealer, EarlyStopper
-from pref_learn.models.vae import VAEModel, VAEClassifier
-from pref_learn.models.mlp import (
-    MLPModel,
-    CategoricalModel,
-    MeanVarianceModel,
-    MLPClassifier,
-)
+from pref_learn.models.vae import VAEModel
 import pref_learn.utils.plot_utils as putils
 
 FLAGS_DEF = define_flags_with_default(
@@ -35,25 +29,16 @@ FLAGS_DEF = define_flags_with_default(
     min_delta=3e-4,
     patience=10,
     lr=1e-3,
-    model_type="MLP",  # can change
-    # MLP
-    hidden_dim=256,
+    model_type="VAE",  # VAE로 고정
     # Attention Encoder
-    encoder_type='mlp', # 'mlp' or 'attention'
+    encoder_type='attention', # 'mlp' or 'attention'
+    hidden_dim=256,
     n_heads=4,
     n_layers=2,
-    # Categorical
-    num_atoms=10,
-    r_min=0,
-    r_max=1,
-    entropy_coeff=0.1,
-    # Mean Var
-    variance_penalty=0.0,
     # VAE
     latent_dim=32,
     kl_weight=1.0,
     learned_prior=False,
-    flow_prior=False,
     use_annealing=False,
     annealer_baseline=0.0,
     annealer_type="cosine",
@@ -120,7 +105,7 @@ def main(_):
         eval_dataset,
         len_set,
         len_query,
-        obs_dim,
+        encoder_input_dim,
     ) = get_datasets(
         FLAGS.dataset_path,
         observation_dim,
@@ -130,58 +115,31 @@ def main(_):
         FLAGS.encoder_type
     )
 
-    if FLAGS.model_type == "MLP":
-        reward_model = MLPModel(obs_dim, FLAGS.hidden_dim)
-    elif FLAGS.model_type == "Categorical":
-        reward_model = CategoricalModel(
-            input_dim=obs_dim,
-            hidden_dim=FLAGS.hidden_dim,
-            n_atoms=FLAGS.num_atoms,
-            r_min=FLAGS.r_min,
-            r_max=FLAGS.r_max,
-            entropy_coeff=FLAGS.entropy_coeff,
+    annealer = None
+    if FLAGS.use_annealing:
+        annealer = Annealer(
+            total_steps=FLAGS.n_epochs // FLAGS.annealer_cycles,
+            shape=FLAGS.annealer_type,
+            baseline=FLAGS.annealer_baseline,
+            cyclical=FLAGS.annealer_cycles > 1,
         )
-    elif FLAGS.model_type == "MeanVar":
-        reward_model = MeanVarianceModel(
-            input_dim=obs_dim,
-            hidden_dim=FLAGS.hidden_dim,
-            variance_penalty=FLAGS.variance_penalty,
-        )
-    elif "VAE" in FLAGS.model_type:
-        annealer = None
-        if FLAGS.use_annealing:
-            annealer = Annealer(
-                total_steps=FLAGS.n_epochs // FLAGS.annealer_cycles,
-                shape=FLAGS.annealer_type,
-                baseline=FLAGS.annealer_baseline,
-                cyclical=FLAGS.annealer_cycles > 1,
-            )
-        if FLAGS.model_type == "VAEClassifier":
-            reward_model = VAEClassifier
-            decoder_input = 2 * obs_dim + FLAGS.latent_dim
-        else:
-            reward_model = VAEModel
-            decoder_input = obs_dim + FLAGS.latent_dim
-        reward_model = reward_model(
-            encoder_input=obs_dim, # For attention, this is pair_dim, for mlp, flattened context
-            decoder_input=decoder_input,
-            latent_dim=FLAGS.latent_dim,
-            hidden_dim=FLAGS.hidden_dim,
-            annotation_size=len_set,
-            size_segment=len_query,
-            kl_weight=FLAGS.kl_weight,
-            learned_prior=FLAGS.learned_prior,
-            flow_prior=FLAGS.flow_prior,
-            annealer=annealer,
-            reward_scaling=FLAGS.reward_scaling,
-            encoder_type=FLAGS.encoder_type,
-            n_heads=FLAGS.n_heads,
-            n_layers=FLAGS.n_layers,
-        )
-    elif FLAGS.model_type == "MLPClassifier":
-        reward_model = MLPClassifier(obs_dim, FLAGS.hidden_dim)
-    else:
-        raise NotImplementedError
+    
+    decoder_input_dim = observation_dim + action_dim + FLAGS.latent_dim
+
+    reward_model = VAEModel(
+        encoder_input_dim=encoder_input_dim,
+        decoder_input_dim=decoder_input_dim,
+        action_dim=action_dim,
+        latent_dim=FLAGS.latent_dim,
+        hidden_dim=FLAGS.hidden_dim,
+        kl_weight=FLAGS.kl_weight,
+        learned_prior=FLAGS.learned_prior,
+        annealer=annealer,
+        reward_scaling=FLAGS.reward_scaling,
+        encoder_type=FLAGS.encoder_type,
+        n_heads=FLAGS.n_heads,
+        n_layers=FLAGS.n_layers,
+    )
 
     device = FLAGS.device
     reward_model = reward_model.to(device)
@@ -205,6 +163,7 @@ def main(_):
                 labels = labels.unsqueeze(0)
             
             optimizer.zero_grad()
+            # 모델은 이제 s1, s2, labels만 받습니다. 내부에서 obs/act를 분리합니다.
             loss, batch_metrics = reward_model(s1, s2, labels)
             loss.backward()
             optimizer.step()
@@ -233,24 +192,14 @@ def main(_):
                         metrics[key].append(val)
 
             if FLAGS.debug_plots and "maze2d" in FLAGS.env:
-                if FLAGS.model_type == "MLP":
-                    fig_dict = putils.plot_mlp(gym_env, reward_model)
-                elif FLAGS.model_type == "Categorical" or FLAGS.model_type == "MeanVar":
-                    fig_dict = putils.plot_mlp_samples(gym_env, reward_model)
-                elif FLAGS.model_type == "MLPClassifier":
-                    fig_dict = putils.plot_classifier(
-                        gym_env, reward_model, eval_dataset
-                    )
-                else:
-                    fig_dict = putils.plot_vae(
-                        gym_env,
-                        reward_model,
-                        eval_dataset,
-                        classifier="Classifier" in FLAGS.model_type,
-                    )
-
+                fig_dict = putils.plot_vae(
+                    gym_env,
+                    reward_model,
+                    eval_dataset,
+                    classifier=False, # VAEClassifier는 제거되었으므로 False
+                )
                 metrics.update(prefix_metrics(fig_dict, "debug_plots"))
-            elif "VAE" in FLAGS.model_type:
+            else:
                 putils.update_posterior(gym_env, reward_model, eval_dataset)
             
 
@@ -272,9 +221,7 @@ def main(_):
         if epoch % FLAGS.save_freq == 0:
             torch.save(reward_model, save_dir + f"/model_{epoch}.pt")
 
-        if (
-            FLAGS.model_type == "VAE" or "VAE" in FLAGS.model_type
-        ) and FLAGS.use_annealing:
+        if FLAGS.use_annealing:
             reward_model.annealer.step()
 
         log_metrics(metrics, epoch, wb_logger)
