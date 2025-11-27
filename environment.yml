@@ -1,0 +1,23 @@
+name: pi-model
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.8
+  - pytorch
+  - torchvision
+  - torchaudio
+  - cudatoolkit=11.3
+  - pip
+  - pip:
+    - absl-py
+    - cloudpickle
+    - gym
+    - matplotlib
+    - numpy
+    - pandas
+    - PyYAML
+    - scikit-learn
+    - tqdm
+    - wandb

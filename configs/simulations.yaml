@@ -1,0 +1,10 @@
+# Simulation Parameters
+T: 10.0          # Total simulation time in seconds
+time_step: 0.01  # Time step for the simulation in seconds
+
+# Controller Parameters (for generate_data.py)
+# Defines the range of Proportional gains (kp) to be used for generating diverse trajectories.
+# The script will linearly interpolate between the start and end values.
+controller_gains:
+  start: 5.0
+  end: 25.0

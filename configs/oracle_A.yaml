@@ -1,0 +1,4 @@
+weights:
+  jerk: -1.0
+  pitch: -1.0
+  settling_time: -0.5
