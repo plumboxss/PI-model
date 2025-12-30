@@ -1,9 +1,15 @@
 import os
+import sys
 import pickle
 import random
 from multiprocessing import Pool, cpu_count
 import numpy as np
 from tqdm import tqdm
+
+# 프로젝트 루트를 Python 경로에 추가
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 
 from src.utils.simulation_utils import SimulationRecorder, generate_data_parser, get_trajectory_features
 from src.simulation.oracle import create_oracle_from_config

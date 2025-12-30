@@ -1,4 +1,5 @@
 import os
+import sys
 import pickle
 import argparse
 import numpy as np
@@ -6,6 +7,11 @@ import pandas as pd
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
+
+# 프로젝트 루트를 Python 경로에 추가
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 
 from src.utils.simulation_utils import get_trajectory_features
 

@@ -4,12 +4,14 @@ import numpy as np
 import torch
 from tqdm import tqdm
 import os
+import sys
 from functools import partial
 
-# Assuming VPL project structure
-# Ensure pref_learn is in the python path
-import sys
-sys.path.append(os.getcwd())
+# 프로젝트 루트를 Python 경로에 추가
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
 from src.models.vae import VAEModel
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -181,26 +183,48 @@ class AdaptationLoop:
 
         self.trajectories = []
         self.features_list = []
-        all_states_list = []
-        all_actions_list = []
+        # 메모리 효율성을 위해 각 궤적의 길이만 저장
+        trajectory_lengths = []
         for i in sorted(raw_data.keys()):
             res = raw_data[i]
             if res.get('features'):
                 self.trajectories.append({'observations': res['state'], 'actions': res['action']})
                 self.features_list.append(np.array(list(res['features'].values())))
-                all_states_list.append(res['state'])
-                all_actions_list.append(res['action'])
+                trajectory_lengths.append(len(res['state']))
 
         self.features_matrix = np.array(self.features_list)
-        all_states = np.concatenate(all_states_list, axis=0)
-        all_actions = np.concatenate(all_actions_list, axis=0)
-        print(f"Loaded {len(self.trajectories)} trajectories and {len(all_states)} total states.")
+        print(f"Loaded {len(self.trajectories)} trajectories.")
 
-        # 상태 및 행동 샘플링을 통해 고정 비교 세트 C 생성
+        # 메모리 효율적인 방법으로 고정 비교 세트 C 생성
+        # 전체를 concatenate하지 않고, 궤적 인덱스와 타임스텝 인덱스를 샘플링
         print(f"Creating fixed comparison set C with size {args.comparison_set_size}...")
-        comparison_indices = np.random.choice(len(all_states), args.comparison_set_size, replace=False)
-        self.comparison_set_C_obs = torch.from_numpy(all_states[comparison_indices]).float().to(self.device)
-        self.comparison_set_C_act = torch.from_numpy(all_actions[comparison_indices]).float().to(self.device)
+        
+        # 각 궤적에서 샘플링할 인덱스 생성
+        total_states = sum(trajectory_lengths)
+        if args.comparison_set_size > total_states:
+            print(f"Warning: comparison_set_size ({args.comparison_set_size}) is larger than total states ({total_states}). Using all states.")
+            args.comparison_set_size = total_states
+        
+        # 누적 길이를 사용하여 각 샘플이 어느 궤적에 속하는지 빠르게 찾기
+        cumsum_lengths = np.cumsum([0] + trajectory_lengths)
+        
+        # 무작위로 샘플링할 전역 인덱스 선택
+        global_indices = np.random.choice(total_states, args.comparison_set_size, replace=False)
+        
+        # 각 전역 인덱스를 (trajectory_idx, timestep_idx)로 변환
+        sampled_obs = []
+        sampled_act = []
+        for global_idx in global_indices:
+            # 이진 검색으로 궤적 인덱스 찾기
+            traj_idx = np.searchsorted(cumsum_lengths, global_idx + 1) - 1
+            timestep_idx = global_idx - cumsum_lengths[traj_idx]
+            sampled_obs.append(self.trajectories[traj_idx]['observations'][timestep_idx])
+            sampled_act.append(self.trajectories[traj_idx]['actions'][timestep_idx])
+        
+        # 샘플링된 상태와 행동을 텐서로 변환
+        self.comparison_set_C_obs = torch.from_numpy(np.array(sampled_obs)).float().to(self.device)
+        self.comparison_set_C_act = torch.from_numpy(np.array(sampled_act)).float().to(self.device)
+        print(f"Comparison set C created with {len(self.comparison_set_C_obs)} states.")
 
         # 3. z 및 컨텍스트 초기화
         self.z_current = torch.randn(1, self.vae_model.latent_dim, device=self.device)
