@@ -8,7 +8,8 @@ from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
 
-# 프로젝트 루트를 Python 경로에 추가
+
+# 프로젝트 루트를 Python 경로에 추`가
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
