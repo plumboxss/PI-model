@@ -134,8 +134,12 @@ class Annealer:
         self.disable = disable
 
     def step(self):
-        if self.current_step < self.total_steps:
+        # Cyclical일 때는 제한 없이 계속 증가, 아닐 때는 total_steps까지만 증가
+        if self.cyclical:
             self.current_step += 1
+        else:
+            if self.current_step < self.total_steps:
+                self.current_step += 1
 
     def slope(self):
         if self.disable:
@@ -144,7 +148,7 @@ class Annealer:
         if self.cyclical:
             step = self.current_step % self.total_steps
         else:
-            step = self.current_step
+            step = min(self.current_step, self.total_steps)
 
         if self.shape == 'linear':
             y = step / self.total_steps
