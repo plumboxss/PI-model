@@ -89,10 +89,7 @@ def get_trajectory_features(recorder, settling_time_threshold=0.01):
 def generate_data_parser():
     parser = argparse.ArgumentParser(description="Generate trajectory data using vehicle simulation.")
     parser.add_argument('--num-episodes', type=int, default=100, help='Number of simulation episodes to run.')
-    parser.add_argument('--oracle-name', type=str, required=True, help="Name of the oracle to use (e.g., 'A', 'B'). Corresponds to 'oracle_A.yaml'.")
+    parser.add_argument('--dataset-id', type=str, default='A', help="Dataset ID for organizing output files (e.g., 'A', 'B').")
     parser.add_argument('--dataset-name', type=str, default=None, help='Name for the generated dataset file.')
     return parser
 
-def visualize_oracle_data(dataset_path, save_dir):
-    print(f"[Placeholder] Visualizing data from {dataset_path} and saving to {save_dir}...")
-    pass

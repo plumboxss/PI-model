@@ -29,29 +29,34 @@ def calculate_state_rewards(states_b, actions_b, z, comparison_set_C_obs, compar
         
         # 배치 계산을 위한 텐서 준비
         # C의 각 요소와 비교하기 위해 상태 반복: (T, N, D_obs)
-        states_b_rpt = states_b.unsqueeze(1).repeat(1, N, 1)
-        actions_b_rpt = actions_b.unsqueeze(1).repeat(1, N, 1)
+        states_b_rpt = states_b.unsqueeze(1).repeat(1, N, 1)  # (T, N, obs_dim)
+        actions_b_rpt = actions_b.unsqueeze(1).repeat(1, N, 1)  # (T, N, act_dim)
         # 배치의 각 상태에 대해 C 반복: (T, N, D_obs), (T, N, D_act)
-        C_obs_rpt = comparison_set_C_obs.unsqueeze(0).repeat(T, 1, 1)
-        C_act_rpt = comparison_set_C_act.unsqueeze(0).repeat(T, 1, 1)
-        # 모든 비교에 대해 z 반복: (T * N, Z)
-        z_rpt = z.repeat(T * N, 1)
+        C_obs_rpt = comparison_set_C_obs.unsqueeze(0).repeat(T, 1, 1)  # (T, N, obs_dim)
+        C_act_rpt = comparison_set_C_act.unsqueeze(0).repeat(T, 1, 1)  # (T, N, act_dim)
+        
+        # z를 (T*N, z_dim)으로 확장
+        z_rpt = z.unsqueeze(0).expand(T * N, -1)  # (T*N, z_dim)
 
-        # 모델 입력을 위해 평탄화
-        states_flat = states_b_rpt.view(T * N, -1)
-        actions_flat = actions_b_rpt.view(T * N, -1)
-        C_obs_flat = C_obs_rpt.view(T * N, -1)
-        C_act_flat = C_act_rpt.view(T * N, -1)
+        # 모델 입력을 위해 reshape: (T*N, obs_dim) -> (T*N, 1, obs_dim)
+        states_reshaped = states_b_rpt.view(T * N, -1).unsqueeze(1)  # (T*N, 1, obs_dim)
+        actions_reshaped = actions_b_rpt.view(T * N, -1).unsqueeze(1)  # (T*N, 1, act_dim)
+        C_obs_reshaped = C_obs_rpt.view(T * N, -1).unsqueeze(1)  # (T*N, 1, obs_dim)
+        C_act_reshaped = C_act_rpt.view(T * N, -1).unsqueeze(1)  # (T*N, 1, act_dim)
 
         # VAE 모델을 사용하여 상태와 비교 세트의 보상을 계산
-        r_states = vae_model.decode(states_flat, actions_flat, z_rpt)
-        r_C = vae_model.decode(C_obs_flat, C_act_flat, z_rpt)
+        r_states = vae_model.decode_reward(states_reshaped, actions_reshaped, z_rpt)  # (T*N, 1, 1)
+        r_C = vae_model.decode_reward(C_obs_reshaped, C_act_reshaped, z_rpt)  # (T*N, 1, 1)
+        
+        # (T*N, 1, 1) -> (T*N,)로 squeeze
+        r_states = r_states.squeeze()  # (T*N,)
+        r_C = r_C.squeeze()  # (T*N,)
 
         # 선호도 확률 P(s > s' | z) 계산
-        probs_flat = torch.sigmoid(r_states - r_C)
+        probs_flat = torch.sigmoid(r_states - r_C)  # (T*N,)
         
         # (T, N) 형태로 변환하여 N에 대해 평균 계산
-        probs = probs_flat.view(T, N)
+        probs = probs_flat.view(T, N)  # (T, N)
         
         # 각 상태의 정규화된 보상은 이러한 확률의 평균
         state_rewards = probs.mean(dim=1) # Shape: (T,)
@@ -145,8 +150,15 @@ def find_implicit_pair(input_traj, input_traj_features, z_current, vae_model,
 
             # 조건 2: 불확실성이 가장 높은 쌍 선택 (P ≈ 0.5)
             # 각 궤적의 총 보상 계산
-            r_in = vae_model.decode(obs_in_trunc, act_in_trunc, z_expanded).sum()
-            r_cand = vae_model.decode(obs_cand, act_cand, z_expanded).sum()
+            # obs_in_trunc: (min_len, obs_dim) -> (1, min_len, obs_dim)
+            obs_in_batch = obs_in_trunc.unsqueeze(0)  # (1, min_len, obs_dim)
+            act_in_batch = act_in_trunc.unsqueeze(0)  # (1, min_len, act_dim)
+            obs_cand_batch = obs_cand.unsqueeze(0)  # (1, min_len, obs_dim)
+            act_cand_batch = act_cand.unsqueeze(0)  # (1, min_len, act_dim)
+            z_batch = z_current.unsqueeze(0)  # (1, latent_dim)
+            
+            r_in = vae_model.decode_reward(obs_in_batch, act_in_batch, z_batch).sum()
+            r_cand = vae_model.decode_reward(obs_cand_batch, act_cand_batch, z_batch).sum()
             
             # 선호도 확률 계산: P(후보 > 입력 | z)
             prob = torch.sigmoid(r_cand - r_in).item()
@@ -271,14 +283,15 @@ class AdaptationLoop:
         s1_batch = np.concatenate([obs1_batch, actions1_batch], axis=-1)
         s2_batch = np.concatenate([obs2_batch, actions2_batch], axis=-1)
 
-        # 배치 차원(단일 컨텍스트) 및 쌍 차원 추가
-        s1_tensor = torch.from_numpy(s1_batch).float().to(self.device).unsqueeze(0)
-        s2_tensor = torch.from_numpy(s2_batch).float().to(self.device).unsqueeze(0)
-        labels_tensor = torch.from_numpy(labels_batch).float().to(self.device).view(1, -1, 1)
+        # 새 모델 인터페이스에 맞게 변환
+        # context_s1: (K, T, D_sa) -> (1, K, T, D_sa)
+        context_s1 = torch.from_numpy(s1_batch).float().to(self.device).unsqueeze(0)  # (1, K, T, D_sa)
+        context_s2 = torch.from_numpy(s2_batch).float().to(self.device).unsqueeze(0)  # (1, K, T, D_sa)
+        context_y = torch.from_numpy(labels_batch).float().to(self.device).unsqueeze(-1).unsqueeze(0)  # (1, K, 1)
 
         with torch.no_grad():
-            mean, log_var = self.vae_model.encode(s1_tensor, s2_tensor, labels_tensor)
-            self.z_current = self.vae_model.reparameterization(mean, torch.exp(0.5 * log_var))
+            mean, log_var = self.vae_model.encode_context(context_s1, context_s2, context_y)
+            self.z_current = self.vae_model.reparameterization(mean, log_var)
         
         print(f"z re-inferred successfully. New z mean: {mean.mean().item():.4f}")
         return self.z_current

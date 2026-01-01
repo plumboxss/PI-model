@@ -2,265 +2,257 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class TrajectoryEncoder(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim):
-        super(TrajectoryEncoder, self).__init__()
-        self.model = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.LeakyReLU(0.2),
-            nn.Linear(hidden_dim, output_dim),
-            nn.LeakyReLU(0.2),
-        )
-
-    def forward(self, x):
-        return self.model(x)
-
-class PairEncoder(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim):
-        super(PairEncoder, self).__init__()
-        self.model = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.LeakyReLU(0.2),
-            nn.Linear(hidden_dim, output_dim),
-        )
-
-    def forward(self, x):
-        return self.model(x)
-
-class SelfAttentionEncoder(nn.Module):
-    def __init__(self, traj_dim, hidden_dim, latent_dim, n_heads=4, n_layers=2):
-        super(SelfAttentionEncoder, self).__init__()
-        self.trajectory_encoder = TrajectoryEncoder(traj_dim, hidden_dim, hidden_dim)
-        pair_input_dim = hidden_dim * 2 + 1  # e1, e2, y
-        self.pair_encoder = PairEncoder(pair_input_dim, hidden_dim, hidden_dim)
-        
-        encoder_layer = nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=n_heads, dim_feedforward=hidden_dim*4, batch_first=True)
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
-        
-        self.output_mlp = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LeakyReLU(0.2)
-        )
-        self.FC_mean = nn.Linear(hidden_dim, latent_dim)
-        self.FC_var = nn.Linear(hidden_dim, latent_dim)
-
-    def forward(self, x):
-        # x: (batch_size, seq_len, input_dim)
-        # input_dim = traj_dim * 2 + 1
-        
-        # Split x into s1, s2, y
-        s1 = x[:, :, :self.trajectory_encoder.model[0].in_features]
-        s2 = x[:, :, self.trajectory_encoder.model[0].in_features:-1]
-        y = x[:, :, -1].unsqueeze(-1)
-        
-        # Encode trajectories
-        e1 = self.trajectory_encoder(s1)
-        e2 = self.trajectory_encoder(s2)
-        
-        # Concatenate embeddings and label
-        pair_input = torch.cat([e1, e2, y], dim=-1)
-        
-        # Encode pair
-        h = self.pair_encoder(pair_input)
-        
-        # Apply Transformer
-        transformer_out = self.transformer_encoder(h)
-        
-        # Aggregate (mean pooling)
-        aggregated = transformer_out.mean(dim=1)
-        
-        h_ = self.output_mlp(aggregated)
-        
-        mean = self.FC_mean(h_)
-        log_var = self.FC_var(h_)
-        
-        return mean, log_var
-
-class Encoder(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim):
-        super(Encoder, self).__init__()
-        self.LSTM = nn.LSTM(input_size=input_dim, hidden_size=hidden_dim, batch_first=True, bidirectional=True)
-        self.fc = nn.Linear(hidden_dim * 2, hidden_dim)
-        self.FC_mean = nn.Linear(hidden_dim, output_dim)
-        self.FC_var = nn.Linear(hidden_dim, output_dim)
-
-    def forward(self, x):
-        _, (hidden, _) = self.LSTM(x)
-        # Concat bidirectional hidden states
-        hidden = torch.cat((hidden[-2, :, :], hidden[-1, :, :]), dim=1)
-        x = self.fc(hidden)
-        mean = self.FC_mean(x)
-        log_var = self.FC_var(x)
-        return mean, log_var
-
-class Decoder(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim):
-        super(Decoder, self).__init__()
-        self.model = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.LeakyReLU(0.2),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LeakyReLU(0.2),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LeakyReLU(0.2),
-            nn.Linear(hidden_dim, output_dim),
-        )
-
-    def forward(self, x):
-        x_hat = self.model(x)
-        return x_hat
+from src.models.trajectory_encoder import TrajectoryEncoder
+from src.models.pair_encoder import PairEncoder
+from src.models.set_encoder import SetEncoder
+from src.models.reward_decoder import RewardDecoder
 
 class VAEModel(nn.Module):
-    def __init__(self, encoder_input_dim, decoder_input_dim, action_dim, latent_dim, hidden_dim, kl_weight=1.0, learned_prior=False, annealer=None, reward_scaling=1.0, encoder_type='attention', n_heads=4, n_layers=2):
+    """
+    VAE model for preference-conditioned reward learning.
+    
+    Architecture:
+    1. Trajectory encoder: τ -> e (fixed-length embedding)
+    2. Pair encoder: (e1, e2, y) -> h_i
+    3. Set encoder: {h_i}_{i=1..K} -> (μ, log_var)
+    4. Reward decoder: r_φ(s, a, z)
+    
+    Forward pass:
+    - Context: K comparisons to estimate z
+    - Query: 1 comparison for loss computation
+    """
+    def __init__(
+        self,
+        obs_dim,
+        act_dim,
+        latent_dim,
+        hidden_dim,
+        kl_weight=1.0,
+        learned_prior=False,
+        annealer=None,
+        reward_scaling=1.0,
+        trajectory_encoder_type='transformer',
+        set_encoder_type='attention',
+        n_heads=4,
+        n_layers=2,
+        trajectory_embedding_dim=None,
+        pair_embedding_dim=None,
+    ):
         super(VAEModel, self).__init__()
-        self.encoder_type = encoder_type
-        self.action_dim = action_dim
-        
-        if self.encoder_type == 'attention':
-            traj_dim = (encoder_input_dim - 1) // 2
-            self.Encoder = SelfAttentionEncoder(traj_dim=traj_dim, hidden_dim=hidden_dim, latent_dim=latent_dim, n_heads=n_heads, n_layers=n_layers)
-        else:
-            self.Encoder = Encoder(encoder_input_dim, hidden_dim, latent_dim)
-            
-        self.Decoder = Decoder(decoder_input_dim, hidden_dim, 1)
+        self.obs_dim = obs_dim
+        self.act_dim = act_dim
         self.latent_dim = latent_dim
-        self.mean = torch.nn.Parameter(torch.zeros(latent_dim), requires_grad=learned_prior)
-        self.log_var = torch.nn.Parameter(torch.zeros(latent_dim), requires_grad=learned_prior)
-        self.learned_prior = learned_prior
+        self.hidden_dim = hidden_dim
         self.kl_weight = kl_weight
+        self.learned_prior = learned_prior
         self.annealer = annealer
         self.scaling = reward_scaling
-
-    def reparameterization(self, mean, var):
-        epsilon = torch.randn_like(var).to(var.device)
-        z = mean + var * epsilon
+        
+        # Trajectory embedding dimension (default: hidden_dim)
+        traj_emb_dim = trajectory_embedding_dim if trajectory_embedding_dim is not None else hidden_dim
+        # Pair embedding dimension (default: hidden_dim)
+        pair_emb_dim = pair_embedding_dim if pair_embedding_dim is not None else hidden_dim
+        
+        # 1. Trajectory encoder: τ (B, T, obs+act) -> e (B, traj_emb_dim)
+        traj_input_dim = obs_dim + act_dim
+        self.trajectory_encoder = TrajectoryEncoder(
+            input_dim=traj_input_dim,
+            hidden_dim=hidden_dim,
+            output_dim=traj_emb_dim,
+            encoder_type=trajectory_encoder_type
+        )
+        
+        # 2. Pair encoder: (e1, e2, y) -> h_i
+        self.pair_encoder = PairEncoder(
+            embedding_dim=traj_emb_dim,
+            hidden_dim=hidden_dim,
+            output_dim=pair_emb_dim
+        )
+        
+        # 3. Set encoder: {h_i} -> (μ, log_var)
+        self.set_encoder = SetEncoder(
+            input_dim=pair_emb_dim,
+            hidden_dim=hidden_dim,
+            latent_dim=latent_dim,
+            encoder_type=set_encoder_type,
+            n_heads=n_heads,
+            n_layers=n_layers
+        )
+        
+        # 4. Reward decoder: (obs, act, z) -> r
+        self.reward_decoder = RewardDecoder(
+            obs_dim=obs_dim,
+            act_dim=act_dim,
+            latent_dim=latent_dim,
+            hidden_dim=hidden_dim,
+            output_dim=1
+        )
+        
+        # Learned prior parameters (if enabled)
+        if learned_prior:
+            self.prior_mean = nn.Parameter(torch.zeros(latent_dim))
+            self.prior_log_var = nn.Parameter(torch.zeros(latent_dim))
+        else:
+            self.register_buffer('prior_mean', torch.zeros(latent_dim))
+            self.register_buffer('prior_log_var', torch.zeros(latent_dim))
+    
+    def reparameterization(self, mean, log_var):
+        """
+        Reparameterization trick: z = μ + σ * ε
+        Args:
+            mean: (B, latent_dim)
+            log_var: (B, latent_dim)
+        Returns:
+            z: (B, latent_dim)
+        """
+        std = torch.exp(0.5 * log_var)
+        epsilon = torch.randn_like(std)
+        z = mean + std * epsilon
         return z
-
-    def encode(self, s1, s2, y):
-        if self.encoder_type == 'attention':
-            # Combine inputs for attention encoder
-            # s1: (B, T, D), s2: (B, T, D), y: (B, T) -> x: (B, T, 2*D + 1)
-            
-            # Force y to match s1's batch and sequence dimensions, adding a feature dimension at the end
-            # s1 shape: (batch_size, seq_len, feature_dim)
-            
-            batch_size = s1.shape[0]
-            seq_len = s1.shape[1]
-            
-            # Reshape y to (batch_size, 1, 1) first. 
-            # Use reshape instead of view to handle non-contiguous tensors if any.
-            y_reshaped = y.reshape(batch_size, 1, 1)
-            
-            # Expand to (batch_size, seq_len, 1)
-            y_expanded = y_reshaped.expand(batch_size, seq_len, 1)
-
-            x = torch.cat([s1, s2, y_expanded], dim=-1)
-            mean, log_var = self.Encoder(x)
-        else:
-            # For LSTM encoder, we might stack differently
-            x = torch.cat([s1, s2, y.unsqueeze(-1)], dim=-1) 
-            mean, log_var = self.Encoder(x)
+    
+    def encode_context(self, context_s1, context_s2, context_y):
+        """
+        Encode context comparisons to estimate latent z.
+        
+        Args:
+            context_s1: (B, K, T, D_sa) - K trajectories (preferred)
+            context_s2: (B, K, T, D_sa) - K trajectories (non-preferred)
+            context_y: (B, K, 1) - preference labels
+        Returns:
+            mean: (B, latent_dim)
+            log_var: (B, latent_dim)
+        """
+        B, K, T, D_sa = context_s1.shape
+        
+        # Reshape to process all trajectories: (B*K, T, D_sa)
+        s1_flat = context_s1.view(B * K, T, D_sa)
+        s2_flat = context_s2.view(B * K, T, D_sa)
+        y_flat = context_y.view(B * K, 1)
+        
+        # 1. Encode trajectories: (B*K, T, D_sa) -> (B*K, traj_emb_dim)
+        e1 = self.trajectory_encoder(s1_flat)  # (B*K, traj_emb_dim)
+        e2 = self.trajectory_encoder(s2_flat)  # (B*K, traj_emb_dim)
+        
+        # 2. Encode pairs: (B*K, traj_emb_dim) -> (B*K, pair_emb_dim)
+        h_flat = self.pair_encoder(e1, e2, y_flat)  # (B*K, pair_emb_dim)
+        
+        # 3. Reshape back: (B*K, pair_emb_dim) -> (B, K, pair_emb_dim)
+        H = h_flat.view(B, K, -1)  # (B, K, pair_emb_dim)
+        
+        # 4. Encode set: (B, K, pair_emb_dim) -> (B, latent_dim)
+        mean, log_var = self.set_encoder(H)
+        
         return mean, log_var
-
-    def decode(self, obs, act, z):
-        # obs: (B, T, O_dim)
-        # act: (B, T, A_dim)
-        # z: (B, T, Z_dim) or (B, 1, Z_dim) broadcasted
-        decoder_input = torch.cat([obs, act, z], dim=-1)
-        r = self.Decoder(decoder_input)
-        return r
-
-    def forward(self, s1, s2, y):
-        # s1, s2: (B, T, D) where D = obs_dim + act_dim
-        mean, log_var = self.encode(s1, s2, y)
-        z = self.reparameterization(mean, torch.exp(0.5 * log_var))
+    
+    def decode_reward(self, obs, act, z):
+        """
+        Decode reward for a trajectory given latent z.
         
-        # Expand z for decoding
-        # z: (B, latent_dim) -> (B, T, latent_dim)
-        num_contexts = s1.shape[0]
-        context_len = s1.shape[1] # Number of pairs in context
-        traj_len = s1.shape[2] # This might be confusing if s1 is flattened.
+        Args:
+            obs: (B, T, obs_dim)
+            act: (B, T, act_dim)
+            z: (B, latent_dim) or (B, T, latent_dim)
+        Returns:
+            r: (B, T, 1) - reward at each timestep
+        """
+        return self.reward_decoder(obs, act, z)
+    
+    def forward(self, context_s1, context_s2, context_y, query_s1, query_s2, query_y):
+        """
+        Forward pass with context-query structure.
         
-        # Assuming s1 passed here is actually (Batch, Sequence_of_Pairs, Trajectory_Features)
-        # In train.py, s1 is (B, T, obs+act). Wait, Encoder takes sequence of pairs.
-        # Let's trace train.py. 
-        # s1: batch['s1'] -> (B, num_pairs, obs_dim+act_dim) if trajectory is length 1?
-        # No, in build_preference_dataset, we have full trajectories.
-        # But the Encoder structure suggests we are feeding a sequence of (traj1, traj2, label).
-        # The TrajectoryEncoder takes 'traj_dim'. 
+        Args:
+            context_s1: (B, K, T, D_sa) - K context trajectories (preferred)
+            context_s2: (B, K, T, D_sa) - K context trajectories (non-preferred)
+            context_y: (B, K, 1) - context preference labels
+            query_s1: (B, T, D_sa) - query trajectory 1
+            query_s2: (B, T, D_sa) - query trajectory 2
+            query_y: (B, 1) - query preference label
+        Returns:
+            loss: scalar tensor
+            metrics: dict with loss components and accuracy
+        """
+        # 1. Encode context to get latent z
+        mean, log_var = self.encode_context(context_s1, context_s2, context_y)
+        z = self.reparameterization(mean, log_var)  # (B, latent_dim)
         
-        # Let's assume z corresponds to the preference for the whole batch/context.
-        # To decode rewards for individual timesteps in s1/s2, we need z broadcasted.
+        # 2. Split query trajectories into obs and act
+        query_obs1 = query_s1[..., :-self.act_dim]  # (B, T, obs_dim)
+        query_act1 = query_s1[..., -self.act_dim:]  # (B, T, act_dim)
+        query_obs2 = query_s2[..., :-self.act_dim]  # (B, T, obs_dim)
+        query_act2 = query_s2[..., -self.act_dim:]  # (B, T, act_dim)
         
-        # Re-checking train.py and dataset structure:
-        # s1 is concatenation of obs and act.
+        # 3. Decode rewards for query trajectories
+        r1 = self.decode_reward(query_obs1, query_act1, z)  # (B, T, 1)
+        r2 = self.decode_reward(query_obs2, query_act2, z)  # (B, T, 1)
         
-        # z: (B, latent_dim)
-        # We need to decode r for each timestep in s1 and s2.
-        # obs1 = s1[..., :-self.action_dim]
-        # act1 = s1[..., -self.action_dim:]
+        # 4. Sum rewards over trajectory to get total return
+        R1 = r1.sum(dim=1) / self.scaling  # (B, 1)
+        R2 = r2.sum(dim=1) / self.scaling  # (B, 1)
         
-        # If s1 is (B, Seq_Len, Feat_Dim), then z needs to be (B, Seq_Len, Latent_Dim).
-        # Check z dim first
-        if z.dim() == 2:
-            # z is (B, Latent_Dim)
-            # s1 is (B, Num_Pairs, Feat_Dim)
-            z_expanded = z.unsqueeze(1).expand(s1.shape[0], s1.shape[1], self.latent_dim)
+        # 5. Bradley-Terry model: p = sigmoid(R1 - R2)
+        p_hat = torch.sigmoid(R1 - R2)  # (B, 1)
+        
+        # 6. Compute losses
+        # Reconstruction loss (BCE)
+        reconstruction_loss = F.binary_cross_entropy(
+            p_hat.view(-1, 1),
+            query_y.view(-1, 1),
+            reduction='mean'
+        )
+        
+        # KL divergence loss: KL(q(z|context) || p(z))
+        if self.learned_prior:
+            prior_mean = self.prior_mean
+            prior_log_var = self.prior_log_var
+            # KL with learned prior
+            kl_loss = -0.5 * torch.sum(
+                1 + log_var - prior_log_var
+                - ((mean - prior_mean).pow(2) + log_var.exp()) / prior_log_var.exp()
+            ) / mean.size(0)
         else:
-            # Assume z is already correct shape or broadcasting works
-            z_expanded = z
+            # Standard KL: KL(q(z|context) || N(0, I))
+            kl_loss = -0.5 * torch.sum(
+                1 + log_var - mean.pow(2) - log_var.exp()
+            ) / mean.size(0)
         
-        # obs1 shape: (B, Num_Pairs, obs_dim)
-        # act1 shape: (B, Num_Pairs, act_dim)
-        obs1 = s1[..., :-self.action_dim]
-        act1 = s1[..., -self.action_dim:]
-        obs2 = s2[..., :-self.action_dim]
-        act2 = s2[..., -self.action_dim:]
-        
-        r0 = self.decode(obs1, act1, z_expanded)
-        r1 = self.decode(obs2, act2, z_expanded)
-        
-        # Sum rewards over trajectory/segment to get total return
-        # r0: (B, Seq_Len, 1) -> sum over Seq_Len -> (B, 1)
-        
-        # Sum over the sequence dimension (dim 1)
-        r_hat1 = r0.sum(dim=1) / self.scaling
-        r_hat2 = r1.sum(dim=1) / self.scaling
-        
-        # Bradley-Terry model
-        # p_hat: (B, 1)
-        p_hat = torch.sigmoid(r_hat1 - r_hat2)
-        
-        p_hat = p_hat.view(-1, 1)
-        labels = y.view(-1, 1)
-        
-        reconstruction_loss = self.reconstruction_loss(labels, p_hat)
-        accuracy = self.accuracy(labels, p_hat)
-        latent_loss = self.latent_loss(mean, log_var)
-        
+        # Annealed KL weight
         kl_weight = self.annealer.slope() if self.annealer else self.kl_weight
-        loss = reconstruction_loss + kl_weight * latent_loss
+        
+        # Total loss
+        loss = reconstruction_loss + kl_weight * kl_loss
+        
+        # Accuracy
+        predicted = (p_hat > 0.5).float()
+        correct = (predicted == query_y.view(-1, 1)).float()
+        accuracy = correct.mean()
         
         metrics = {
             "loss": loss.item(),
             "reconstruction_loss": reconstruction_loss.item(),
-            "kld_loss": latent_loss.item(),
+            "kld_loss": kl_loss.item(),
             "accuracy": accuracy.item(),
             "kl_weight": kl_weight
         }
+        
         return loss, metrics
-
-    def reconstruction_loss(self, y, p_hat):
-        # BCE Loss
-        return F.binary_cross_entropy(p_hat, y, reduction="mean")
-
-    def latent_loss(self, mean, log_var):
-        # KL Divergence
-        kld = -0.5 * torch.sum(1 + log_var - mean.pow(2) - log_var.exp())
-        return kld / mean.size(0) # Normalize by batch size
-
-    def accuracy(self, y, p_hat):
-        predicted = (p_hat > 0.5).float()
-        correct = (predicted == y).float()
-        return correct.mean()
-
+    
+    # Backward compatibility: old interface for single batch
+    def forward_legacy(self, s1, s2, y):
+        """
+        Legacy forward pass for backward compatibility.
+        Treats each sample as its own context (K=1) and query.
+        """
+        B, T, D_sa = s1.shape
+        
+        # Treat as context with K=1
+        context_s1 = s1.unsqueeze(1)  # (B, 1, T, D_sa)
+        context_s2 = s2.unsqueeze(1)  # (B, 1, T, D_sa)
+        context_y = y.unsqueeze(1)  # (B, 1, 1)
+        
+        # Use same trajectories as query
+        query_s1 = s1  # (B, T, D_sa)
+        query_s2 = s2  # (B, T, D_sa)
+        query_y = y  # (B, 1)
+        
+        return self.forward(context_s1, context_s2, context_y, query_s1, query_s2, query_y)

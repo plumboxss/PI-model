@@ -34,8 +34,9 @@ FLAGS_DEF = define_flags_with_default(
     patience=10,
     lr=1e-3,
     model_type="VAE",  # VAE로 고정
-    # Attention Encoder
-    encoder_type='attention', # 'mlp' or 'attention'
+    # Encoder types
+    trajectory_encoder_type='transformer',  # 'transformer', 'lstm', 'mlp'
+    set_encoder_type='attention',  # 'attention', 'deepset'
     hidden_dim=256,
     n_heads=4,
     n_layers=2,
@@ -55,6 +56,7 @@ FLAGS_DEF = define_flags_with_default(
     env='Suspension-v0', # Default env name to avoid flag error
     # Dataset
     dataset_path="",
+    context_size=5,  # Number of context comparisons (K)
     logging=WandBLogger.get_default_config(),
     # seed=42, # Duplicate seed definition removed
     # plotting
@@ -119,7 +121,8 @@ def main(_):
         action_dim,
         FLAGS.batch_size,
         FLAGS.set_size,
-        FLAGS.encoder_type
+        FLAGS.set_encoder_type,
+        FLAGS.context_size
     )
 
     annealer = None
@@ -131,19 +134,17 @@ def main(_):
             cyclical=FLAGS.annealer_cycles > 1,
         )
     
-    decoder_input_dim = observation_dim + action_dim + FLAGS.latent_dim
-
     reward_model = VAEModel(
-        encoder_input_dim=encoder_input_dim,
-        decoder_input_dim=decoder_input_dim,
-        action_dim=action_dim,
+        obs_dim=observation_dim,
+        act_dim=action_dim,
         latent_dim=FLAGS.latent_dim,
         hidden_dim=FLAGS.hidden_dim,
         kl_weight=FLAGS.kl_weight,
         learned_prior=FLAGS.learned_prior,
         annealer=annealer,
         reward_scaling=FLAGS.reward_scaling,
-        encoder_type=FLAGS.encoder_type,
+        trajectory_encoder_type=FLAGS.trajectory_encoder_type,
+        set_encoder_type=FLAGS.set_encoder_type,
         n_heads=FLAGS.n_heads,
         n_layers=FLAGS.n_layers,
     )
@@ -159,23 +160,40 @@ def main(_):
         metrics["epoch"] = epoch
 
         for batch_idx, batch in enumerate(train_loader):
-            s1 = batch["s1"].to(device).float()
-            s2 = batch["s2"].to(device).float()
-            labels = batch["labels"].to(device).float()
-
-            if FLAGS.encoder_type == 'attention':
-                # For attention, ensure input is (B, Seq, Dim)
-                # DataLoader usually returns (B, T, Dim) which is correct for attention encoder.
-                # If we unsqueeze here, it becomes (1, B, T, Dim) or (B, 1, T, Dim), which causes issues.
-                # So we REMOVE the unsqueeze operations.
-                pass
-                # s1 = s1.unsqueeze(0)
-                # s2 = s2.unsqueeze(0)
-                # labels = labels.unsqueeze(0)
+            # Extract context and query data
+            context_s1 = batch["context_s1"].to(device).float()
+            context_s2 = batch["context_s2"].to(device).float()
+            context_y = batch["context_y"].to(device).float()
+            query_s1 = batch["query_s1"].to(device).float()
+            query_s2 = batch["query_s2"].to(device).float()
+            query_y = batch["query_y"].to(device).float()
+            
+            # Shape validation (first batch only)
+            if batch_idx == 0 and epoch == 0:
+                print(f"\n=== Shape Validation ===")
+                print(f"context_s1: {context_s1.shape} (B, K, T, D_sa)")
+                print(f"context_s2: {context_s2.shape} (B, K, T, D_sa)")
+                print(f"context_y: {context_y.shape} (B, K, 1)")
+                print(f"query_s1: {query_s1.shape} (B, T, D_sa)")
+                print(f"query_s2: {query_s2.shape} (B, T, D_sa)")
+                print(f"query_y: {query_y.shape} (B, 1)")
+                print(f"=======================\n")
+                
+                # Assertions
+                B, K, T, D_sa = context_s1.shape
+                assert context_s2.shape == (B, K, T, D_sa), f"context_s2 shape mismatch: {context_s2.shape}"
+                assert context_y.shape == (B, K, 1), f"context_y shape mismatch: {context_y.shape}"
+                assert query_s1.shape == (B, T, D_sa), f"query_s1 shape mismatch: {query_s1.shape}"
+                assert query_s2.shape == (B, T, D_sa), f"query_s2 shape mismatch: {query_s2.shape}"
+                assert query_y.shape == (B, 1), f"query_y shape mismatch: {query_y.shape}"
+                assert D_sa == observation_dim + action_dim, f"D_sa mismatch: {D_sa} != {observation_dim + action_dim}"
             
             optimizer.zero_grad()
-            # 모델은 이제 s1, s2, labels만 받습니다. 내부에서 obs/act를 분리합니다.
-            loss, batch_metrics = reward_model(s1, s2, labels)
+            # Forward pass with context-query structure
+            loss, batch_metrics = reward_model(
+                context_s1, context_s2, context_y,
+                query_s1, query_s2, query_y
+            )
             loss.backward()
             optimizer.step()
             
@@ -188,19 +206,17 @@ def main(_):
         if epoch % FLAGS.eval_freq == 0:
             for batch in test_loader:
                 with torch.no_grad():
-                    s1 = batch["s1"].to(device).float()
-                    s2 = batch["s2"].to(device).float()
-                    labels = batch["labels"].to(device).float()
-
-                    if FLAGS.encoder_type == 'attention':
-                        # Same reshaping for evaluation - REMOVED unsqueeze
-                        pass
-                        # s1 = s1.unsqueeze(0)
-                        # s2 = s2.unsqueeze(0)
-                        # labels = labels.unsqueeze(0)
+                    # Extract context and query data
+                    context_s1 = batch["context_s1"].to(device).float()
+                    context_s2 = batch["context_s2"].to(device).float()
+                    context_y = batch["context_y"].to(device).float()
+                    query_s1 = batch["query_s1"].to(device).float()
+                    query_s2 = batch["query_s2"].to(device).float()
+                    query_y = batch["query_y"].to(device).float()
 
                     loss, batch_metrics = reward_model(
-                        s1, s2, labels
+                        context_s1, context_s2, context_y,
+                        query_s1, query_s2, query_y
                     )
 
                     for key, val in prefix_metrics(batch_metrics, "eval").items():

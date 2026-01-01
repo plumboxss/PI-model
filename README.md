@@ -32,10 +32,10 @@
 먼저, 차량 시뮬레이션을 실행하여 기본적인 궤적 데이터셋을 생성합니다. 시뮬레이션은 다양한 P-제어기(Proportional controller) 게인 값을 사용하여 다채로운 주행 패턴을 만들어냅니다.
 
 ```bash
-# 예시: 'A' 오라클을 사용하여 500개의 궤적 생성
-python scripts/generate_data.py --num-episodes 500 --oracle-name A --dataset-name raw_trajectories_A
+# 예시: 500개의 궤적 생성
+python scripts/generate_data.py --num-episodes 500 --dataset-id A --dataset-name raw_trajectories_A
 ```
-*이 명령은 `datasets/raw_trajectories_A` 디렉토리를 생성하고 그 안에 다수의 `.pkl` 파일을 저장합니다.*
+*이 명령은 `artifacts/A/datasets/raw_trajectories_A.pkl` 파일을 생성합니다.*
 
 ### 2단계: 선호도 데이터셋 구축
 
@@ -43,7 +43,7 @@ python scripts/generate_data.py --num-episodes 500 --oracle-name A --dataset-nam
 
 ```bash
 # 예시: 5개의 클러스터와 20,000개의 선호도 쌍으로 데이터셋 생성
-python scripts/build_preference_dataset.py --input-dir datasets/raw_trajectories_A --output-path datasets/preference_dataset_A.pkl --num-clusters 5 --num-pairs 20000
+python scripts/build_preference_dataset.py --input_path artifacts/A/datasets/raw_trajectories_A.pkl --output_path datasets/preference_dataset_A.pkl --num-clusters 5 --num-pairs 20000
 ```
 
 ### 3단계: VAE 모델 사전 학습

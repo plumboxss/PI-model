@@ -48,12 +48,13 @@ def get_reward_fn(vae_model, z_adapted):
             float: 계산된 스칼라 보상 값.
         """
         with torch.no_grad():
-            # 입력 numpy 배열을 torch 텐서로 변환하고 배치 차원 추가
-            s_tensor = torch.from_numpy(s).float().to(device).unsqueeze(0)
-            a_tensor = torch.from_numpy(a).float().to(device).unsqueeze(0)
+            # 입력 numpy 배열을 torch 텐서로 변환
+            # 단일 timestep이므로 (1, 1, dim) 형태로 변환
+            s_tensor = torch.from_numpy(s).float().to(device).unsqueeze(0).unsqueeze(0)  # (1, 1, obs_dim)
+            a_tensor = torch.from_numpy(a).float().to(device).unsqueeze(0).unsqueeze(0)  # (1, 1, act_dim)
             
             # 모델의 디코더를 사용하여 보상 계산
-            reward = vae_model.decode(s_tensor, a_tensor, z_adapted)
+            reward = vae_model.decode_reward(s_tensor, a_tensor, z_adapted)  # (1, 1, 1)
             
             return reward.item()
 
@@ -112,3 +113,5 @@ if __name__ == '__main__':
     parser.add_argument('--adapted_z_path', type=str, required=True, help='Path to the adapted z vector file (adapted_z.pt).')
     args = parser.parse_args()
     main(args)
+
+
