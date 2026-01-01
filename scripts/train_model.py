@@ -41,7 +41,7 @@ FLAGS_DEF = define_flags_with_default(
     n_heads=4,
     n_layers=2,
     # VAE
-    latent_dim=32,
+    latent_dim=8,
     kl_weight=1.0,
     learned_prior=False,
     use_annealing=True, # 기본값 변경: False -> True
