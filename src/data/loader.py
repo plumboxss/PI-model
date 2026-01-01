@@ -13,7 +13,7 @@ def get_model_id_and_train_test_split(dataset, train_split_path, test_split_path
     """
     return None, None, None
 
-def get_datasets(dataset_path, observation_dim, action_dim, batch_size=4, set_size=-1, encoder_type='attention', context_size=5):
+def get_datasets(dataset_path, observation_dim, action_dim, batch_size=4, set_size=-1, encoder_type='attention', context_size=5, split_seed=42):
     """
     Get train and test datasets with context-query structure.
     
@@ -25,34 +25,80 @@ def get_datasets(dataset_path, observation_dim, action_dim, batch_size=4, set_si
         set_size: unused (for compatibility)
         encoder_type: unused (for compatibility)
         context_size: number of context comparisons (K)
+        split_seed: random seed for train/test group split (for reproducibility)
     """
     # Load dataset using pickle
     with open(dataset_path, 'rb') as f:
         dataset = pickle.load(f)
     
     # Group by model_id (user group) for context sampling
-    # If model_id exists, use it; otherwise group randomly
+    # If model_id exists, use it; otherwise raise error or check for alternatives
     if 'model_id' in dataset:
         grouped_indices = defaultdict(list)
         for idx in range(len(dataset['labels'])):
             model_id = dataset['model_id'][idx]
             grouped_indices[model_id].append(idx)
     else:
-        # If no model_id, create random groups
-        num_groups = max(1, len(dataset['labels']) // context_size)
-        grouped_indices = defaultdict(list)
-        for idx in range(len(dataset['labels'])):
-            group_id = idx % num_groups
-            grouped_indices[group_id].append(idx)
+        # Check for alternative grouping keys
+        alternative_keys = ['oracle_id', 'driver_id', 'user_id', 'annotator_id']
+        found_key = None
+        for key in alternative_keys:
+            if key in dataset:
+                found_key = key
+                break
+        
+        if found_key:
+            print(f"Warning: 'model_id' not found, using '{found_key}' for grouping.")
+            grouped_indices = defaultdict(list)
+            for idx in range(len(dataset['labels'])):
+                group_id = dataset[found_key][idx]
+                grouped_indices[group_id].append(idx)
+        else:
+            # No meaningful grouping key found - this breaks few-shot adaptation
+            raise ValueError(
+                "No 'model_id' (or alternative: 'oracle_id', 'driver_id', 'user_id', 'annotator_id') found in dataset. "
+                "Few-shot preference adaptation requires grouping by user/oracle identity. "
+                "Random grouping would make z represent noise rather than user preferences."
+            )
     
-    # Split train/test
+    # Split train/test with shuffle for proper distribution
     all_groups = list(grouped_indices.keys())
-    train_size = int(0.8 * len(all_groups))
-    train_groups = all_groups[:train_size]
-    test_groups = all_groups[train_size:]
+    # Use seed-based shuffle for reproducibility
+    rng = np.random.RandomState(split_seed)
+    shuffled_groups = all_groups.copy()
+    rng.shuffle(shuffled_groups)
     
-    train_dataset = ContextQueryDataset(dataset, grouped_indices, train_groups, context_size)
-    test_dataset = ContextQueryDataset(dataset, grouped_indices, test_groups, context_size)
+    train_size = int(0.8 * len(shuffled_groups))
+    train_groups = shuffled_groups[:train_size]
+    test_groups = shuffled_groups[train_size:]
+    
+    # Train dataset: use random context sampling for diversity
+    train_dataset = ContextQueryDataset(
+        dataset, grouped_indices, train_groups, context_size,
+        deterministic_context=False,  # Random context for training diversity
+        deterministic_seed=split_seed
+    )
+    
+    # Test dataset: use deterministic context sampling for evaluation stability
+    test_dataset = ContextQueryDataset(
+        dataset, grouped_indices, test_groups, context_size,
+        deterministic_context=True,  # Deterministic context for evaluation stability
+        deterministic_seed=split_seed
+    )
+    
+    # Verify deterministic context sampling (test only)
+    if len(test_dataset) > 0:
+        # Get first sample twice and verify context is identical
+        # This verifies that deterministic_context=True works correctly
+        sample1 = test_dataset[0]
+        sample2 = test_dataset[0]
+        # Check if context tensors are identical (should be for deterministic sampling)
+        context_match = torch.equal(sample1['context_s1'], sample2['context_s1'])
+        if context_match:
+            print(f"✅ Test dataset: deterministic_context=True verified (evaluation stability enabled)")
+            print(f"   Same (group_id, query_idx) produces identical context across calls")
+        else:
+            print(f"⚠️  Warning: Test dataset context is not deterministic (this should not happen)")
     
     # num_workers=0 is safer for Windows
     train_loader = DataLoader(
@@ -84,6 +130,9 @@ def get_datasets(dataset_path, observation_dim, action_dim, batch_size=4, set_si
     
     return train_loader, test_loader, train_dataset, test_dataset, len_set, len_query, encoder_input_dim
 
+# Global flag to check shapes only once (first batch)
+_first_batch_checked = False
+
 def collate_context_query(batch):
     """
     Collate function for context-query batches.
@@ -93,6 +142,8 @@ def collate_context_query(batch):
     Returns:
         batched dict with same keys, stacked along batch dimension
     """
+    global _first_batch_checked
+    
     # Stack context data: (B, K, T, D_sa)
     context_s1 = torch.stack([item['context_s1'] for item in batch])
     context_s2 = torch.stack([item['context_s2'] for item in batch])
@@ -102,6 +153,17 @@ def collate_context_query(batch):
     query_s1 = torch.stack([item['query_s1'] for item in batch])
     query_s2 = torch.stack([item['query_s2'] for item in batch])
     query_y = torch.stack([item['query_y'] for item in batch])
+    
+    # Verify shapes on first batch only
+    if not _first_batch_checked:
+        B, K, T, D_sa = context_s1.shape
+        assert context_s2.shape == (B, K, T, D_sa), f"context_s2 shape mismatch: {context_s2.shape} vs {(B, K, T, D_sa)}"
+        assert context_y.shape == (B, K, 1), f"context_y shape mismatch: {context_y.shape} vs {(B, K, 1)}"
+        assert query_s1.shape == (B, T, D_sa), f"query_s1 shape mismatch: {query_s1.shape} vs {(B, T, D_sa)}"
+        assert query_s2.shape == (B, T, D_sa), f"query_s2 shape mismatch: {query_s2.shape} vs {(B, T, D_sa)}"
+        assert query_y.shape == (B, 1), f"query_y shape mismatch: {query_y.shape} vs {(B, 1)}"
+        print(f"✅ First batch shape verification passed: context=(B={B}, K={K}, T={T}, D={D_sa}), query=(B={B}, T={T}, D={D_sa})")
+        _first_batch_checked = True
     
     return {
         'context_s1': context_s1,
@@ -117,25 +179,38 @@ class ContextQueryDataset(Dataset):
     Dataset that provides context-query structure for few-shot learning.
     
     Each sample consists of:
-    - Context: K comparisons from the same user group
+    - Context: K comparisons from the same user group (sampled dynamically or deterministically)
     - Query: 1 comparison for loss computation
+    
+    Note: 
+    - If deterministic_context=False: Context is sampled randomly in __getitem__ for diversity.
+      This prevents overfitting to fixed context sets and better matches few-shot adaptation goals.
+    - If deterministic_context=True: Context is sampled deterministically based on (group_id, query_idx).
+      This ensures evaluation stability by using the same context for the same sample across epochs.
     """
-    def __init__(self, pref_dataset, grouped_indices, group_ids, context_size):
+    def __init__(self, pref_dataset, grouped_indices, group_ids, context_size, 
+                 deterministic_context=False, deterministic_seed=0):
         """
         Args:
             pref_dataset: loaded preference dataset dict
             grouped_indices: dict mapping group_id to list of indices
             group_ids: list of group IDs to use (train or test)
             context_size: number of context comparisons (K)
+            deterministic_context: if True, use deterministic context sampling (for test/eval stability)
+            deterministic_seed: seed for deterministic context sampling (used in hash)
         """
         self.pref_dataset = pref_dataset
         self.grouped_indices = grouped_indices
         self.group_ids = group_ids
         self.context_size = context_size
+        self.deterministic_context = deterministic_context
+        self.deterministic_seed = deterministic_seed
         
-        # Create samples: each sample is (group_id, context_indices, query_idx)
-        # 재현성을 위해 seed 설정
-        np.random.seed(42)
+        # Track first call for verification logging
+        self._first_call_verified = False
+        
+        # Create samples: each sample is (group_id, query_idx)
+        # Context will be sampled in __getitem__ (randomly or deterministically)
         self.samples = []
         for group_id in group_ids:
             indices = grouped_indices[group_id]
@@ -144,25 +219,46 @@ class ContextQueryDataset(Dataset):
                 continue
             
             # Create multiple samples from each group by rotating query
+            # Each sample uses a different query_idx, context will be sampled per call
             for query_idx in range(len(indices)):
-                # Context: randomly sample K indices (excluding query)
-                context_candidates = [i for i in range(len(indices)) if i != query_idx]
-                if len(context_candidates) < context_size:
-                    continue
-                context_indices = np.random.choice(
-                    context_candidates,
-                    size=context_size,
-                    replace=False
-                ).tolist()
-                
-                self.samples.append((group_id, context_indices, query_idx))
+                self.samples.append((group_id, query_idx))
     
     def __len__(self):
         return len(self.samples)
     
     def __getitem__(self, idx):
-        group_id, context_indices, query_idx = self.samples[idx]
+        group_id, query_idx = self.samples[idx]
         group_indices = self.grouped_indices[group_id]
+        
+        # Build context candidate pool (excluding query_idx to ensure no overlap)
+        context_candidates = [i for i in range(len(group_indices)) if i != query_idx]
+        
+        if len(context_candidates) < self.context_size:
+            # Fallback: if not enough candidates, use all available (with replacement if needed)
+            if len(context_candidates) == 0:
+                # Edge case: only one sample in group, cannot create context-query split
+                raise ValueError(f"Group {group_id} has insufficient data for context-query split")
+            # Use all available candidates and repeat if necessary
+            context_indices = (context_candidates * ((self.context_size // len(context_candidates)) + 1))[:self.context_size]
+        else:
+            # Sample context indices (randomly or deterministically)
+            if self.deterministic_context:
+                # Deterministic sampling: use hash-based seed for reproducibility
+                # Same (group_id, query_idx) always produces the same context
+                seed = (hash((group_id, query_idx, self.deterministic_seed)) & 0xffffffff)
+                rs = np.random.RandomState(seed)
+                context_indices = rs.choice(
+                    context_candidates,
+                    size=self.context_size,
+                    replace=False
+                ).tolist()
+            else:
+                # Random sampling: different context each time (for training diversity)
+                context_indices = np.random.choice(
+                    context_candidates,
+                    size=self.context_size,
+                    replace=False
+                ).tolist()
         
         # Get context data
         context_s1_list = []

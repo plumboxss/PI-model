@@ -122,7 +122,8 @@ def main(_):
         FLAGS.batch_size,
         FLAGS.set_size,
         FLAGS.set_encoder_type,
-        FLAGS.context_size
+        FLAGS.context_size,
+        split_seed=FLAGS.seed  # Use same seed for train/test split reproducibility
     )
 
     annealer = None
