@@ -241,6 +241,7 @@ class AdaptationLoop:
         # 3. z 및 컨텍스트 초기화
         self.z_current = torch.randn(1, self.vae_model.latent_dim, device=self.device)
         self.context = [] # List to store (traj1_obs, traj2_obs, label)
+        self.z_history = [self.z_current.clone()]  # z 변화 추적
         print(f"Initialized z with shape: {self.z_current.shape}")
 
 
@@ -293,6 +294,9 @@ class AdaptationLoop:
             mean, log_var = self.vae_model.encode_context(context_s1, context_s2, context_y)
             self.z_current = self.vae_model.reparameterization(mean, log_var)
         
+        # z 변화 추적
+        self.z_history.append(self.z_current.clone())
+        
         print(f"z re-inferred successfully. New z mean: {mean.mean().item():.4f}")
         return self.z_current
 
@@ -322,6 +326,22 @@ class AdaptationLoop:
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         torch.save(self.z_current, output_path)
         print(f"Final z saved to {output_path}")
+        
+        # 시각화 생성
+        if self.args.visualize:
+            print("\nGenerating adaptation visualization plots...")
+            from src.utils.visualization import plot_z_evolution, plot_adaptation_summary
+            
+            viz_dir = os.path.join(os.path.dirname(output_path), 'visualizations')
+            os.makedirs(viz_dir, exist_ok=True)
+            
+            plot_z_evolution(self.z_history, save_path=os.path.join(viz_dir, 'z_evolution.png'))
+            
+            context_sizes = [len(self.context[:i+1]) for i in range(len(self.z_history))]
+            plot_adaptation_summary(self.z_history, context_sizes, 
+                                  save_path=os.path.join(viz_dir, 'adaptation_summary.png'))
+            
+            print(f"Visualizations saved to {viz_dir}")
 
 
 if __name__ == '__main__':
@@ -331,6 +351,7 @@ if __name__ == '__main__':
     parser.add_argument('--output_z_path', type=str, default='data/adapted_z.pt', help='최종 어댑트된 z 벡터 저장 경로.')
     parser.add_argument('--comparison_set_size', type=int, default=1000, help='고정 비교 세트 C의 상태 수.')
     parser.add_argument('--diversity_epsilon', type=float, default=0.1, help='다양한 쌍을 위한 최소 특성 차이.')
+    parser.add_argument('--visualize', action='store_true', help='Generate adaptation visualization plots')
 
     args = parser.parse_args()
     

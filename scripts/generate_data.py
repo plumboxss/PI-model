@@ -37,7 +37,7 @@ def run_single_episode(args):
     }
     return episode_idx, essential_result
 
-def generate_dataset(num_episode, dataset_name, dataset_id):
+def generate_dataset(num_episode, dataset_name, dataset_id, visualize=False):
     args_list = []
 
     for idx in range(num_episode):
@@ -70,10 +70,24 @@ def generate_dataset(num_episode, dataset_name, dataset_id):
     with open(save_path, 'wb') as f:
         pickle.dump(results, f)
     print(f"Dataset saved to {save_path}")
+    
+    # 시각화 생성
+    if visualize:
+        print("\nGenerating data visualization plots...")
+        from src.utils.visualization import plot_trajectory_samples, plot_feature_distributions
+        
+        viz_dir = f"artifacts/{dataset_id}/visualizations"
+        os.makedirs(viz_dir, exist_ok=True)
+        
+        plot_trajectory_samples(results, n_samples=6, save_path=os.path.join(viz_dir, 'trajectory_samples.png'))
+        plot_feature_distributions(results, save_path=os.path.join(viz_dir, 'feature_distributions.png'))
+        
+        print(f"Visualizations saved to {viz_dir}")
 
 # python scripts/generate_data.py --num-episodes 40000 --dataset-id A
 def main():
     parser = generate_data_parser()
+    parser.add_argument('--visualize', action='store_true', help='Generate data visualization plots')
     args = parser.parse_args()
     num_episodes = args.num_episodes
     dataset_id = args.dataset_id
@@ -83,8 +97,7 @@ def main():
     print(f"Generating dataset with {num_episodes} episodes")
     print(f"Dataset name: {dataset_name}")
     print(f"Dataset ID: {dataset_id}")
-    generate_dataset(num_episodes, dataset_name, dataset_id)
-    print("=" * 50)
+    generate_dataset(num_episodes, dataset_name, dataset_id, visualize=args.visualize)
 
 if __name__ == "__main__":
     main()

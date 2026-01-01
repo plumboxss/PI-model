@@ -66,6 +66,7 @@ FLAGS_DEF = define_flags_with_default(
     # biased
     biased_mode="grid",
     comment="", # Add comment flag
+    save_training_curves=True,  # Save training curves to local file
 )
 
 
@@ -156,6 +157,9 @@ def main(_):
     optimizer = torch.optim.Adam(reward_model.parameters(), lr=FLAGS.lr)
     early_stop = EarlyStopper(FLAGS.patience, FLAGS.min_delta)
     best_criteria = None
+    # 전체 학습 히스토리 저장 (시각화용)
+    metrics_history = defaultdict(list)
+    
     for epoch in range(FLAGS.n_epochs):
         metrics = defaultdict(list)
         metrics["epoch"] = epoch
@@ -257,6 +261,30 @@ def main(_):
             reward_model.annealer.step()
 
         log_metrics(metrics, epoch, wb_logger)
+        
+        # 메트릭 히스토리 업데이트 (시각화용)
+        for key, val in metrics.items():
+            if isinstance(val, list):
+                avg_val = np.mean(val)
+            else:
+                avg_val = val
+            metrics_history[key].append(avg_val)
+        
+        # 학습 곡선 로컬 저장 (마지막 epoch 또는 주기적으로)
+        if FLAGS.save_training_curves and (epoch == FLAGS.n_epochs - 1 or epoch % FLAGS.save_freq == 0):
+            from src.utils.visualization import plot_training_curves
+            
+            # 메트릭 히스토리 준비 (eval 메트릭은 eval_freq에 맞춰 필터링)
+            plot_metrics = {}
+            for key in ['train/loss', 'eval/loss', 'train/accuracy', 'eval/accuracy', 
+                       'train/kld_loss', 'eval/kld_loss', 'train/kl_weight']:
+                if key in metrics_history:
+                    plot_metrics[key] = metrics_history[key]
+            
+            plot_training_curves(
+                plot_metrics,
+                save_path=os.path.join(save_dir, 'training_curves.png')
+            )
 
 
 if __name__ == "__main__":

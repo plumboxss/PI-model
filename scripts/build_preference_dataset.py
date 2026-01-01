@@ -135,6 +135,25 @@ def main(args):
     print("Dataset shapes:")
     for k, v in final_dataset.items():
         print(f"  {k}: {v.shape}")
+    
+    # 시각화 생성
+    if args.visualize:
+        print("\nGenerating preference dataset visualization plots...")
+        from src.utils.visualization import plot_clustering_results, plot_preference_distribution
+        
+        viz_dir = os.path.join(os.path.dirname(args.output_path), 'visualizations')
+        os.makedirs(viz_dir, exist_ok=True)
+        
+        plot_clustering_results(
+            features_scaled, cluster_labels, centroids_scaled,
+            save_path=os.path.join(viz_dir, 'clustering_results.png')
+        )
+        plot_preference_distribution(
+            final_dataset,
+            save_path=os.path.join(viz_dir, 'preference_distribution.png')
+        )
+        
+        print(f"Visualizations saved to {viz_dir}")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Build preference dataset from raw trajectories using feature-based clustering.")
@@ -142,5 +161,6 @@ if __name__ == '__main__':
     parser.add_argument('--output_path', type=str, required=True, help='Path to save the final preference dataset pkl file.')
     parser.add_argument('--num_clusters', type=int, default=16, help='Number of user groups to cluster trajectories into.')
     parser.add_argument('--num_pairs', type=int, default=20000, help='Number of preference pairs to generate.')
+    parser.add_argument('--visualize', action='store_true', help='Generate visualization plots')
     args = parser.parse_args()
     main(args)

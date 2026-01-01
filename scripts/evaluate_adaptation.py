@@ -76,41 +76,81 @@ def main(args):
     reward_function = get_reward_fn(vae_model, z_adapted)
     print("New reward function r_new(s, a) has been defined.")
 
-    # --- 다음 개발 단계 ---
-    # 이제 'reward_function'을 사용하여 실제 평가를 수행할 수 있습니다.
-    
-    # 예제 1: 기존 궤적 데이터셋을 로드하여 점수 매기기
-    print("\n--- Example: Scoring existing trajectories ---")
-    # trajectory_dataset_path = "path/to/your/raw_trajectories.pkl" # generate_data.py의 결과물
-    # with open(trajectory_dataset_path, 'rb') as f:
-    #     raw_data = pickle.load(f)
-    
-    # trajectory_scores = {}
-    # for i in tqdm(sorted(raw_data.keys()), desc="Scoring trajectories"):
-    #     traj = raw_data[i]
-    #     total_reward = 0
-    #     for s, a in zip(traj['state'], traj['action']):
-    #         total_reward += reward_function(s, a)
-    #     trajectory_scores[i] = total_reward / len(traj['state'])
-    
-    # # 점수가 가장 높은 궤적들이 목표 선호도를 반영하는지 확인
-    # sorted_trajectories = sorted(trajectory_scores.items(), key=lambda item: item[1], reverse=True)
-    # print("Top 5 trajectories with the highest scores:")
-    # for traj_id, score in sorted_trajectories[:5]:
-    #     print(f"  Trajectory {traj_id}: Average Reward = {score:.4f}")
-
-    # 예제 2: 이 보상 함수를 사용하여 RL 에이전트 학습 (더 이상적인 평가)
-    # import gym
-    # env = gym.make("YourCarSim-v0")
-    # new_env = RewardWrapper(env, reward_function)
-    # # 이제 `new_env`에서 RL 에이전트를 학습시키고, 그 결과를 평가합니다.
-    
-    print("\nEvaluation script skeleton is ready. Implement the actual evaluation logic next.")
+    # 3. 궤적 데이터셋이 제공되면 평가 및 시각화
+    if args.trajectory_dataset_path:
+        print(f"\n--- Loading and scoring trajectories from {args.trajectory_dataset_path} ---")
+        with open(args.trajectory_dataset_path, 'rb') as f:
+            raw_data = pickle.load(f)
+        
+        # 궤적 점수 계산
+        trajectory_scores = {}
+        trajectories_list = []
+        for i in tqdm(sorted(raw_data.keys()), desc="Scoring trajectories"):
+            traj = raw_data[i]
+            # 궤적 형식 변환
+            if 'state' in traj and 'action' in traj:
+                traj_dict = {
+                    'observations': traj['state'],
+                    'actions': traj['action']
+                }
+            elif 'observations' in traj and 'actions' in traj:
+                traj_dict = traj
+            else:
+                continue
+                
+            trajectories_list.append(traj_dict)
+            
+            total_reward = 0
+            for s, a in zip(traj_dict['observations'], traj_dict['actions']):
+                total_reward += reward_function(s, a)
+            trajectory_scores[i] = total_reward / len(traj_dict['observations'])
+        
+        # 결과 출력
+        sorted_trajectories = sorted(trajectory_scores.items(), key=lambda item: item[1], reverse=True)
+        print(f"\nTop 10 trajectories with the highest scores:")
+        for traj_id, score in sorted_trajectories[:10]:
+            print(f"  Trajectory {traj_id}: Average Reward = {score:.4f}")
+        
+        # 시각화 생성
+        if args.visualize:
+            print("\n--- Generating visualization plots ---")
+            from src.utils.visualization import plot_reward_distribution, plot_before_after_comparison
+            
+            viz_dir = os.path.join(os.path.dirname(args.adapted_z_path), 'visualizations')
+            os.makedirs(viz_dir, exist_ok=True)
+            
+            # 1. 보상 분포
+            plot_reward_distribution(
+                trajectories_list,
+                reward_function,
+                top_k=10,
+                save_path=os.path.join(viz_dir, 'reward_distribution.png')
+            )
+            
+            # 2. 적응 전/후 비교 (적응 전 보상 함수가 있는 경우)
+            if args.before_z_path:
+                print("Loading before-adaptation z vector for comparison...")
+                z_before = torch.load(args.before_z_path, map_location=device)
+                reward_before = get_reward_fn(vae_model, z_before)
+                
+                plot_before_after_comparison(
+                    trajectories_list,
+                    reward_before,
+                    reward_function,
+                    save_path=os.path.join(viz_dir, 'before_after_comparison.png')
+                )
+            
+            print(f"Visualizations saved to {viz_dir}")
+    else:
+        print("\nNote: Use --trajectory_dataset_path to score and visualize trajectories.")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Evaluate the adapted reward function.")
     parser.add_argument('--vae_model_path', type=str, required=True, help='Path to the pretrained VAE model (.pt file).')
     parser.add_argument('--adapted_z_path', type=str, required=True, help='Path to the adapted z vector file (adapted_z.pt).')
+    parser.add_argument('--trajectory_dataset_path', type=str, default=None, help='Path to trajectory dataset for scoring (.pkl file).')
+    parser.add_argument('--visualize', action='store_true', help='Generate visualization plots')
+    parser.add_argument('--before_z_path', type=str, default=None, help='Path to before-adaptation z vector for comparison (optional).')
     args = parser.parse_args()
     main(args)
 
