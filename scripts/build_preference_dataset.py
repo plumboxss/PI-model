@@ -44,7 +44,43 @@ def main(args):
     features_matrix = np.array(features_list)
     print(f"Extracted {len(trajectories)} trajectories with features.")
 
-    # 2. 피처 정규화 및 K-Means 클러스터링
+    # 2. 유의미한 궤적 길이 결정 (settling time 기반)
+    # settling time 이후의 데이터는 이미 안정화되어서 의미 없으므로 제거
+    print("Determining meaningful trajectory length based on settling times...")
+    settling_times = features_matrix[:, feature_names.index('settling_time')]
+    
+    # 원본 궤적 데이터에서 시간 정보를 가져와 settling time을 타임스텝 인덱스로 변환
+    settling_time_indices = []
+    for i, result in enumerate(sorted(raw_data.keys())):
+        if 'features' in result and result['features'] is not None:
+            if all(k in result['features'] for k in feature_names):
+                time_array = np.array(result['time'])
+                settling_time = settling_times[len(settling_time_indices)]
+                
+                # settling time에 해당하는 타임스텝 인덱스 찾기
+                if len(time_array) > 0:
+                    # settling time에 가장 가까운 타임스텝 인덱스 찾기
+                    settling_idx = np.argmin(np.abs(time_array - settling_time))
+                    # 여유분 추가 (settling time의 1.2배 또는 최소 10 타임스텝)
+                    settling_idx = min(int(settling_idx * 1.2) + 10, len(time_array) - 1)
+                    settling_time_indices.append(settling_idx)
+                else:
+                    settling_time_indices.append(0)
+    
+    if len(settling_time_indices) > 0:
+        # 95th percentile을 사용하여 대부분의 궤적이 안정화되는 시점 결정
+        meaningful_length = int(np.percentile(settling_time_indices, 95))
+        # 최소 길이와 비교하여 안전하게 설정
+        min_len = min(len(t['observations']) for t in trajectories)
+        meaningful_length = min(meaningful_length, min_len)
+        print(f"Meaningful trajectory length determined: {meaningful_length} timesteps (95th percentile of settling times)")
+        print(f"  Settling time indices: min={min(settling_time_indices)}, max={max(settling_time_indices)}, mean={np.mean(settling_time_indices):.1f}")
+    else:
+        # Fallback: 최소 길이 사용
+        meaningful_length = min(len(t['observations']) for t in trajectories)
+        print(f"Warning: Could not determine meaningful length from settling times. Using minimum length: {meaningful_length}")
+
+    # 3. 피처 정규화 및 K-Means 클러스터링
     print(f"Normalizing features and performing K-Means clustering with K={args.num_clusters}...")
     scaler = StandardScaler()
     features_scaled = scaler.fit_transform(features_matrix)
@@ -54,7 +90,7 @@ def main(args):
     centroids_scaled = kmeans.cluster_centers_
     print(f"Clustering complete. Found {len(np.unique(cluster_labels))} clusters.")
 
-    # 3. 각 클러스터의 선호도 방향 자동 정의
+    # 4. 각 클러스터의 선호도 방향 자동 정의
     # 전체 피처의 평균(정규화되었으므로 0)을 기준으로 각 클러스터의 특성을 파악합니다.
     # 중심점의 값이 양수이면 해당 피처 값이 평균보다 높은 그룹, 음수이면 낮은 그룹입니다.
     # 이를 바탕으로 각 클러스터에 대한 고유한 선호도 방향 벡터를 생성합니다.
@@ -74,7 +110,7 @@ def main(args):
     def get_preference_score(features, directions):
         return np.dot(features, directions)
 
-    # 4. 선호도 데이터셋 생성
+    # 5. 선호도 데이터셋 생성
     print(f"Generating {args.num_pairs} preference pairs for {args.num_clusters} user groups...")
     
     final_dataset = {
@@ -84,8 +120,8 @@ def main(args):
     }
     
     num_trajectories = len(trajectories)
-    min_len = min(len(t['observations']) for t in trajectories)
-    print(f"All trajectories will be truncated to the minimum length of {min_len}.")
+    print(f"All trajectories will be truncated to meaningful length of {meaningful_length} timesteps.")
+    print(f"  This removes post-settling data that could cause KL loss collapse.")
 
     for _ in tqdm(range(args.num_pairs)):
         # a. 무작위로 두 개의 서로 다른 궤적 선택
@@ -109,17 +145,17 @@ def main(args):
             pref_traj, non_pref_traj = trajectories[idx2], trajectories[idx1]
         label = 1.0
 
-        # f. 데이터셋에 추가 (궤적 길이 통일)
-        final_dataset['observations'].append(pref_traj['observations'][:min_len])
-        final_dataset['actions'].append(pref_traj['actions'][:min_len])
+        # f. 데이터셋에 추가 (유의미한 길이로 통일, settling time 이후 데이터 제거)
+        final_dataset['observations'].append(pref_traj['observations'][:meaningful_length])
+        final_dataset['actions'].append(pref_traj['actions'][:meaningful_length])
         
-        final_dataset['observations_2'].append(non_pref_traj['observations'][:min_len])
-        final_dataset['actions_2'].append(non_pref_traj['actions'][:min_len])
+        final_dataset['observations_2'].append(non_pref_traj['observations'][:meaningful_length])
+        final_dataset['actions_2'].append(non_pref_traj['actions'][:meaningful_length])
 
         final_dataset['labels'].append(label)
         final_dataset['model_id'].append(cluster_id)
 
-    # 5. 최종 데이터셋 형식 변환 및 저장
+    # 6. 최종 데이터셋 형식 변환 및 저장
     print("Converting to final format and saving...")
     for k in ['observations', 'actions', 'observations_2', 'actions_2']:
         final_dataset[k] = np.expand_dims(np.array(final_dataset[k]), axis=1)

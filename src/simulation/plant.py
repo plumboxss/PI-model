@@ -14,8 +14,9 @@ class Vehicle_Parameters:
         
         self.k_s_f = 35000.0  # Front suspension stiffness [N/m]
         self.k_s_r = 30000.0  # Rear suspension stiffness [N/m]
-        self.c_s_f = 2500.0   # Front suspension damping [N*s/m]
-        self.c_s_r = 2000.0   # Rear suspension damping [N*s/m]
+        # Damping reduced to make control input influence more visible
+        self.c_s_f = 1500.0   # Front suspension damping [N*s/m]
+        self.c_s_r = 1200.0   # Rear suspension damping [N*s/m]
         self.k_us_f = 250000.0 # Front unsprung stiffness [N/m]
         self.k_us_r = 200000.0 # Rear unsprung stiffness [N/m]
         self.l_f = 1.1        # Distance from CG to front axle [m]
