@@ -100,10 +100,13 @@ def main(_):
     gym_env.observation_space.seed(FLAGS.seed)
     # set_random_seed(FLAGS.seed) # Moved to training_utils
     set_seed(FLAGS.seed)
+    # Loader에서 x_com(마지막 1차원)을 제거하고 정규화하므로 여기서도 맞춰서 -1 처리
     if hasattr(gym_env, "reward_observation_space"):
         observation_dim = gym_env.reward_observation_space.shape[0]
     else:
         observation_dim = gym_env.observation_space.shape[0]
+    observation_dim = observation_dim - 1  # drop x_com
+    assert observation_dim > 0, "observation_dim must be positive after removing x_com"
     if "maze" in FLAGS.env:
         gym_env.set_biased_mode(FLAGS.biased_mode)
     action_dim = gym_env.action_space.shape[0]
