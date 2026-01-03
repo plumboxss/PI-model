@@ -13,11 +13,11 @@ class RewardDecoder(nn.Module):
         # Common net g(obs, act)
         common_input_dim = obs_dim + act_dim
         self.common_net = nn.Sequential(
-            nn.Linear(common_input_dim, 256),
+            nn.Linear(common_input_dim, hidden_dim),
             nn.LeakyReLU(0.2),
-            nn.Linear(256, 256),
+            nn.Linear(hidden_dim, hidden_dim),
             nn.LeakyReLU(0.2),
-            nn.Linear(256, output_dim),
+            nn.Linear(hidden_dim, output_dim),
         )
 
         # Personal net h(obs, act, z)

@@ -39,6 +39,7 @@ python scripts/generate_data.py \
     --dataset-name raw_trajectories_A \
     --visualize
 ```
+python scripts/generate_data.py --num-episodes 500 --dataset-id A --dataset-name raw_trajectories_A --visualize
 *이 명령은 `artifacts/A/datasets/raw_trajectories_A.pkl` 파일을 생성하고, 시각화는 `artifacts/A/visualizations/`에 저장됩니다.*
 
 ### 2단계: 선호도 데이터셋 구축

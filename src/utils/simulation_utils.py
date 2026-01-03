@@ -52,58 +52,87 @@ def get_trajectory_features(recorder, settling_time_threshold=0.01):
     time = np.array(recorder['time'])
     states = np.array(recorder['state_all'])
     actions = np.array(recorder['action_all'])
+    # Acceleration logs (may be missing in some runs)
+    acc = np.array(recorder['state_ddot_all']) if 'state_ddot_all' in recorder.results else np.array([])
 
     # 1. Jerk
     # Check for empty or too short trajectories to avoid errors
     if len(time) < 2:
-        return {"jerk": 0.0, "pitch": 0.0, "settling_time": 0.0}
+        return {"jerk": 0.0, "pitch": 0.0, "settling_time": 0.0, "rms_acceleration": 0.0}
 
     jerk = np.mean(np.abs(np.diff(actions, n=2, axis=0) / np.diff(time[:-1])[:, np.newaxis]))
 
     # 2. Pitch
     pitch_mean = np.mean(np.abs(states[:, 6])) # 6 is the index for theta (pitch)
 
-    # 3. Settling Time
-    # Settling time: when the RMS of pitch angle over a window falls below 5% of its initial RMS
-    # This measures decay of oscillation energy and is more sensitive to damping differences.
+    # 2-1. RMS acceleration (comfort indicator)
+    def estimate_acc_from_states():
+        if len(states) >= 3:
+            dt = np.mean(np.diff(time))
+            dt = dt if dt > 1e-8 else 1.0
+            acc_est = np.diff(states, n=2, axis=0) / (dt * dt)  # shape (T-2, state_dim)
+            acc_norm_est = np.linalg.norm(acc_est, axis=1)
+            return float(np.sqrt(np.mean(acc_norm_est ** 2)))
+        return 0.0
+
+    if acc.size > 0 and not np.allclose(acc, 0.0, atol=1e-6):
+        acc_norm = np.linalg.norm(acc, axis=1)
+        rms_acc = float(np.sqrt(np.mean(acc_norm ** 2)))
+        # If measured acceleration is essentially zero everywhere (sensor not provided), fallback
+        if rms_acc < 1e-8:
+            rms_acc = estimate_acc_from_states()
+    else:
+        rms_acc = estimate_acc_from_states()
+
+    # 3. Settling Time (control-theoretic: final-value band + hold time)
+    # ------------------------------------------------------------------
+    # Definition:
+    #  - final_value: mean of the signal over the last tail_duration seconds
+    #  - tolerance band: |x(t) - final_value| <= max(rel_tol*|final_value|, abs_tol)
+    #  - settling time: earliest t_s such that the signal stays within the band
+    #    for a continuous hold_time interval.
     pitch_angle = states[:, 6]  # 6 is the index for theta (pitch angle)
 
-    # Window size: ~4% of trajectory length (at least 5 timesteps) for smoother RMS
-    window_size = max(5, len(pitch_angle) // 25)
+    tail_duration = 1.0   # seconds used to compute final value
+    rel_tol = 0.05        # relative tolerance (5%)
+    abs_tol = 1e-4        # absolute floor
+    hold_time = 0.3       # seconds the signal must stay in-band
 
-    # Compute RMS over sliding window
-    def rms_window(arr, start, end):
-        segment = arr[start:end]
-        return np.sqrt(np.mean(segment * segment))
-
-    # Initial RMS from the first window (avoid near-zero divide)
-    initial_rms = rms_window(pitch_angle, 0, window_size)
-    if initial_rms < 1e-8:
-        settling_time = 0.0
+    total_time = float(time[-1]) if len(time) > 0 else 0.0
+    if len(time) < 2:
+        settling_time = total_time
     else:
-        threshold = 0.12 * initial_rms  # 12% of initial RMS (more lenient to spread settling times)
-        settling_idx = len(time) - 1  # default to end
+        dt = float(np.mean(np.diff(time)))
+        dt = dt if dt > 1e-8 else 1e-3  # guard against zero/near-zero dt
 
-        for i in range(len(pitch_angle) - window_size + 1):
-            cur_rms = rms_window(pitch_angle, i, i + window_size)
-            if cur_rms < threshold:
-                # ensure it stays low for the remainder (or next window)
-                # check next window as simple stability check
-                if i + window_size < len(pitch_angle):
-                    next_rms = rms_window(pitch_angle, i + 1, min(len(pitch_angle), i + 1 + window_size))
-                    if next_rms < threshold:
-                        settling_idx = i
-                        break
-                else:
-                    settling_idx = i
-                    break
+        # --- Final value over the tail window ---
+        tail_start = total_time - tail_duration
+        tail_mask = time >= tail_start
+        if not np.any(tail_mask):
+            tail_mask = np.ones_like(time, dtype=bool)
+        final_value = float(np.mean(pitch_angle[tail_mask]))
 
-        settling_time = time[settling_idx]
+        # --- Tolerance band ---
+        tol = max(rel_tol * abs(final_value), abs_tol)
+        inside = np.abs(pitch_angle - final_value) <= tol
+
+        # --- Hold-time condition ---
+        hold_steps = max(1, int(np.round(hold_time / dt)))
+        settling_time = total_time  # fallback if never settled
+        if len(inside) >= hold_steps:
+            # Convolution over boolean to find first run of all True of length hold_steps
+            window = np.ones(hold_steps, dtype=np.int32)
+            conv = np.convolve(inside.astype(np.int32), window, mode='valid')
+            hits = np.where(conv == hold_steps)[0]
+            if len(hits) > 0:
+                first_hit = int(hits[0])
+                settling_time = float(time[min(first_hit, len(time) - 1)])
 
     return {
         "jerk": float(jerk),
         "pitch": float(pitch_mean),
-        "settling_time": float(settling_time)
+        "settling_time": float(settling_time),
+        "rms_acceleration": float(rms_acc)
     }
 
 def generate_data_parser():

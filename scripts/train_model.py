@@ -47,7 +47,7 @@ FLAGS_DEF = define_flags_with_default(
     use_annealing=True, # 기본값 변경: False -> True
     annealer_baseline=0.0,
     annealer_type="cosine",
-    annealer_cycles=4,
+    annealer_cycles=1,
     # Training
     n_epochs=500,
     eval_freq=50,
@@ -56,7 +56,7 @@ FLAGS_DEF = define_flags_with_default(
     env='Suspension-v0', # Default env name to avoid flag error
     # Dataset
     dataset_path="",
-    context_size=5,  # Number of context comparisons (K)
+    context_size=15,  # Number of context comparisons (K)
     logging=WandBLogger.get_default_config(),
     # seed=42, # Duplicate seed definition removed
     # plotting

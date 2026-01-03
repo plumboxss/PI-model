@@ -3,13 +3,11 @@ import sys
 import pickle
 import argparse
 import numpy as np
-import pandas as pd
-from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
 
 
-# 프로젝트 루트를 Python 경로에 추`가
+# 프로젝트 루트를 Python 경로에 추가
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
@@ -25,8 +23,8 @@ def main(args):
     features_list = []
     trajectories = []
     # 피처 이름은 get_trajectory_features 함수가 반환하는 키와 일치해야 합니다.
-    # src/utils/simulation_utils.py에서 반환하는 키: "jerk", "pitch", "settling_time"
-    feature_names = ['jerk', 'pitch', 'settling_time']
+    # src/utils/simulation_utils.py에서 반환하는 키: "jerk", "pitch", "settling_time", "rms_acceleration"
+    feature_names = ['jerk', 'pitch', 'settling_time', 'rms_acceleration']
     for i in sorted(raw_data.keys()):
         result = raw_data[i]
         if 'features' in result and result['features'] is not None:
@@ -80,38 +78,22 @@ def main(args):
         meaningful_length = min(len(t['observations']) for t in trajectories)
         print(f"Warning: Could not determine meaningful length from settling times. Using minimum length: {meaningful_length}")
 
-    # 3. 피처 정규화 및 K-Means 클러스터링
-    print(f"Normalizing features and performing K-Means clustering with K={args.num_clusters}...")
+    # 3. 피처 정규화 (단위 차이를 제거하여 공정한 가중치 적용)
     scaler = StandardScaler()
     features_scaled = scaler.fit_transform(features_matrix)
-    
-    kmeans = KMeans(n_clusters=args.num_clusters, random_state=42, n_init=10)
-    cluster_labels = kmeans.fit_predict(features_scaled)
-    centroids_scaled = kmeans.cluster_centers_
-    print(f"Clustering complete. Found {len(np.unique(cluster_labels))} clusters.")
 
-    # 4. 각 클러스터의 선호도 방향 자동 정의
-    # 전체 피처의 평균(정규화되었으므로 0)을 기준으로 각 클러스터의 특성을 파악합니다.
-    # 중심점의 값이 양수이면 해당 피처 값이 평균보다 높은 그룹, 음수이면 낮은 그룹입니다.
-    # 이를 바탕으로 각 클러스터에 대한 고유한 선호도 방향 벡터를 생성합니다.
-    # 예: "저크는 낮고(-1) 피치는 높은(+1) 것을 선호"하는 그룹 등
-    cluster_preference_directions = {}
-    for i in range(args.num_clusters):
-        # 중심점 값을 부호로 변환하여 선호도 방향으로 사용 (+1: 높을수록 선호, -1: 낮을수록 선호)
-        # 예를 들어, 어떤 클러스터의 avg_jerk 중심값이 음수이면, 그 그룹은 낮은 avg_jerk를 선호한다고 해석
-        preference_vector = np.sign(centroids_scaled[i])
-        # 모든 피처를 낮을수록 선호하는 기본 규칙과 조합하여 다양성 부여
-        # 여기서는 간단하게 중심점의 부호를 그대로 사용. 0인 경우 -1로 설정(낮을수록 좋다고 가정)
-        preference_vector[preference_vector == 0] = -1 
-        cluster_preference_directions[i] = preference_vector
-        print(f"Cluster {i} preference directions: {preference_vector}")
-
-    # 각 클러스터의 선호도 점수 계산 함수
-    def get_preference_score(features, directions):
-        return np.dot(features, directions)
+    # 4. 가상 유저 생성 (feature-weighted oracle)
+    num_users = 200
+    user_weights = []
+    for _ in range(num_users):
+        w = np.random.uniform(-1.0, 1.0, size=len(feature_names))
+        norm = np.linalg.norm(w) + 1e-8
+        user_weights.append(w / norm)
+    user_weights = np.array(user_weights)
+    print(f"Created {num_users} virtual users (random normalized weights in feature space).")
 
     # 5. 선호도 데이터셋 생성
-    print(f"Generating {args.num_pairs} preference pairs for {args.num_clusters} user groups...")
+    print(f"Generating {args.num_pairs} preference pairs using feature-weighted oracle...")
     
     final_dataset = {
         'observations': [], 'actions': [],
@@ -127,18 +109,13 @@ def main(args):
         # a. 무작위로 두 개의 서로 다른 궤적 선택
         idx1, idx2 = np.random.choice(num_trajectories, 2, replace=False)
         
-        # b. 첫 번째 궤적이 속한 클러스터(사용자 그룹)를 기준으로 삼음
-        cluster_id = cluster_labels[idx1]
-        
-        # c. 해당 사용자 그룹의 고유한 선호도 규칙을 가져옴
-        preference_directions = cluster_preference_directions[cluster_id]
-        
-        # d. 해당 그룹의 선호도에 따라 점수 계산
-        score1 = get_preference_score(features_scaled[idx1], preference_directions)
-        score2 = get_preference_score(features_scaled[idx2], preference_directions)
+        # b. 가상 유저 선택 및 점수 계산
+        user_id = np.random.randint(0, num_users)
+        w = user_weights[user_id]
+        score1 = float(np.dot(w, features_scaled[idx1]))
+        score2 = float(np.dot(w, features_scaled[idx2]))
 
-        # e. 점수가 더 높은 쪽이 선호됨
-        # 점수가 높은 쪽을 traj1으로 고정하고 label을 1.0으로 통일
+        # c. 점수가 더 높은 궤적이 선호됨
         if score1 >= score2:
             pref_traj, non_pref_traj = trajectories[idx1], trajectories[idx2]
         else:
@@ -153,7 +130,7 @@ def main(args):
         final_dataset['actions_2'].append(non_pref_traj['actions'][:meaningful_length])
 
         final_dataset['labels'].append(label)
-        final_dataset['model_id'].append(cluster_id)
+        final_dataset['model_id'].append(user_id)
 
     # 6. 최종 데이터셋 형식 변환 및 저장
     print("Converting to final format and saving...")
@@ -175,15 +152,11 @@ def main(args):
     # 시각화 생성
     if args.visualize:
         print("\nGenerating preference dataset visualization plots...")
-        from src.utils.visualization import plot_clustering_results, plot_preference_distribution
+        from src.utils.visualization import plot_preference_distribution
         
         viz_dir = os.path.join(os.path.dirname(args.output_path), 'visualizations')
         os.makedirs(viz_dir, exist_ok=True)
         
-        plot_clustering_results(
-            features_scaled, cluster_labels, centroids_scaled,
-            save_path=os.path.join(viz_dir, 'clustering_results.png')
-        )
         plot_preference_distribution(
             final_dataset,
             save_path=os.path.join(viz_dir, 'preference_distribution.png')
@@ -192,10 +165,9 @@ def main(args):
         print(f"Visualizations saved to {viz_dir}")
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Build preference dataset from raw trajectories using feature-based clustering.")
+    parser = argparse.ArgumentParser(description="Build preference dataset from raw trajectories using feature-weighted oracle.")
     parser.add_argument('--input_path', type=str, required=True, help='Path to the raw trajectory data pkl file from generate_data.py.')
     parser.add_argument('--output_path', type=str, required=True, help='Path to save the final preference dataset pkl file.')
-    parser.add_argument('--num_clusters', type=int, default=16, help='Number of user groups to cluster trajectories into.')
     parser.add_argument('--num_pairs', type=int, default=20000, help='Number of preference pairs to generate.')
     parser.add_argument('--visualize', action='store_true', help='Generate visualization plots')
     args = parser.parse_args()

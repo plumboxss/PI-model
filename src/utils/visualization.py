@@ -73,7 +73,7 @@ def plot_trajectory_samples(trajectories: Dict, n_samples: int = 6, save_path: O
 
 def plot_feature_distributions(trajectories: Dict, save_path: Optional[str] = None):
     """궤적 특징 분포 시각화"""
-    jerks, pitches, settling_times = [], [], []
+    jerks, pitches, settling_times, rms_accs = [], [], [], []
     
     for traj in trajectories.values():
         if 'features' in traj and traj['features']:
@@ -84,8 +84,11 @@ def plot_feature_distributions(trajectories: Dict, save_path: Optional[str] = No
                 pitches.append(features['pitch'])
             if 'settling_time' in features:
                 settling_times.append(features['settling_time'])
+            if 'rms_acceleration' in features:
+                rms_accs.append(features['rms_acceleration'])
     
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    axes = axes.flatten()
     
     if jerks:
         axes[0].hist(jerks, bins=30, alpha=0.7, edgecolor='black')
@@ -113,6 +116,18 @@ def plot_feature_distributions(trajectories: Dict, save_path: Optional[str] = No
         axes[2].set_title('Settling Time Distribution')
         axes[2].legend()
         axes[2].grid(True, alpha=0.3)
+
+    if rms_accs:
+        axes[3].hist(rms_accs, bins=30, alpha=0.7, edgecolor='black', color='purple')
+        axes[3].axvline(np.mean(rms_accs), color='r', linestyle='--', linewidth=2, label=f'Mean: {np.mean(rms_accs):.4f}')
+        axes[3].set_xlabel('RMS Acceleration')
+        axes[3].set_ylabel('Frequency')
+        axes[3].set_title('RMS Acceleration Distribution')
+        axes[3].legend()
+        axes[3].grid(True, alpha=0.3)
+    else:
+        axes[3].axis('off')
+        axes[3].text(0.5, 0.5, 'No RMS Acceleration data', ha='center', va='center', fontsize=10, transform=axes[3].transAxes)
     
     plt.suptitle('Trajectory Feature Distributions', fontsize=14, fontweight='bold')
     plt.tight_layout()

@@ -16,10 +16,14 @@ from src.simulation.controller import PController
 from src.simulation.env import SingleScenarioEnv
 
 def run_single_episode(args):
-    eride_p_gain, episode_idx = args
+    eride_p_gain, eride_d_gain, shaping_factor, bump_height, bump_half_width, episode_idx = args
     
     env = SingleScenarioEnv()
-    controller = PController(kp=eride_p_gain)
+    # Bump customization: (position_m, half_width_m, height_m)
+    new_specs = [(3.0, bump_half_width, bump_height)]
+    env.plant.bump.customize(new_specs)
+
+    controller = PController(kp=eride_p_gain, kd=eride_d_gain, shaping_factor=shaping_factor)
     recorder = SimulationRecorder(env, controller, downsample=20)
 
     recorder.simulate(seed=None)
@@ -28,6 +32,10 @@ def run_single_episode(args):
 
     essential_result = {
         "eride_p_gain": eride_p_gain,
+        "eride_d_gain": eride_d_gain,
+        "shaping_factor": shaping_factor,
+        "bump_height": bump_height,
+        "bump_half_width": bump_half_width,
         "features": features,
         "time": recorder['time'],
         "state": recorder['state_all'],
@@ -41,8 +49,23 @@ def generate_dataset(num_episode, dataset_name, dataset_id, visualize=False):
     args_list = []
 
     for idx in range(num_episode):
-        eride_p_gain = random.randint(30, 300)
-        args_list.append((eride_p_gain, idx))
+        # Mixture of aggressive (fast but rough) and smooth (slow but comfortable) trajectories
+        if random.random() < 0.5:
+            # Aggressive: high P, low D, less shaping => quicker but choppier
+            eride_p_gain = random.randint(150, 300)
+            eride_d_gain = random.uniform(0.0, 15.0)
+            shaping_factor = random.uniform(0.5, 0.8)
+        else:
+            # Smooth: lower P, higher D, stronger shaping => slower but smoother
+            eride_p_gain = random.randint(30, 160)
+            eride_d_gain = random.uniform(15.0, 50.0)
+            shaping_factor = random.uniform(0.8, 1.0)
+
+        # Road bump variability (keep within stable physical limits)
+        bump_height = random.uniform(0.05, 0.13)       # 5cm ~ 13cm
+        bump_half_width = random.uniform(0.8, 1.6)     # keep >=0.8m to avoid instability
+
+        args_list.append((eride_p_gain, eride_d_gain, shaping_factor, bump_height, bump_half_width, idx))
 
     total_episode = len(args_list)
     print(f"Current available CPU cores: {cpu_count()}")
