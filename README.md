@@ -2,7 +2,11 @@
 
 ## 1. 개요
 
-이 프로젝트는 시뮬레이션된 차량의 서스펜션을 제어하기 위한 선호도 기반 보상 학습 시스템을 구현하고 평가합니다. 핵심 아이디어는 소수의 궤적 샘플 간 쌍대 비교 데이터로부터 사용자의 잠재적인 선호도 표현을 학습하는 것입니다. 이렇게 학습된 잠재 선호도 벡터는 보상 모델을 조건화(condition)하여, 특정 사용자의 요구(예: 부드러운 승차감 선호 vs. 스포티한 핸들링 선호)에 맞게 차량의 제어 동작을 신속하게 적응시킬 수 있도록 합니다.
+이 프로젝트는 시뮬레이션된 차량의 서스펜션을 제어하기 위한 선호도 기반 보상 학습 시스템을 구현하고 평가합니다. 핵심 아이디어는 소수의 궤적 샘플 간 쌍대 비교 데이터로부터 잠재 선호도 벡터 `z`를 학습하고, 이를 조건부 보상 모델에 주입해 사용자 맞춤 보상을 추론하는 것입니다. 최근 업데이트로 다음이 반영되었습니다:
+- 시뮬레이션 다양성: PD+shaping 제어기(`kp/kd/shaping_factor`)와 범프 높이/폭 랜덤화, 승차감 지표(`rms_acceleration`) 추가.
+- 데이터셋: K-Means 대신 가상 유저 200명의 가중치 기반 오라클(dot-product)로 라벨 생성.
+- 모델: 보상 디코더를 공통(g) + 개인(h) residual 구조로 분리, 개인 헤드를 영 초기화.
+- 학습: `context_size=15`, `annealer_cycles=1` 기본값으로 KL 붕괴 완화.
 
 모든 방법론은 `project_intent_description.txt` 문서에 기술된 개념을 기반으로 합니다.
 
@@ -29,7 +33,7 @@
 
 ### 1단계: 원본 궤적 데이터 생성
 
-먼저, 차량 시뮬레이션을 실행하여 기본적인 궤적 데이터셋을 생성합니다. 시뮬레이션은 다양한 P-제어기(Proportional controller) 게인 값을 사용하여 다채로운 주행 패턴을 만들어냅니다.
+먼저, 차량 시뮬레이션을 실행하여 기본적인 궤적 데이터셋을 생성합니다. PD 게인(`kp/kd`), shaping, 범프 높이/폭을 랜덤화해 “빠르지만 거친” vs “느리지만 부드러운” 궤적을 함께 생성합니다. 궤적 피처에는 `jerk`, `pitch`, `settling_time`(최종값 밴드+유지시간 기준), `rms_acceleration`이 포함됩니다.
 
 ```bash
 # 예시: 500개의 궤적 생성 (시각화 포함)
@@ -39,19 +43,16 @@ python scripts/generate_data.py \
     --dataset-name raw_trajectories_A \
     --visualize
 ```
-python scripts/generate_data.py --num-episodes 500 --dataset-id A --dataset-name raw_trajectories_A --visualize
 *이 명령은 `artifacts/A/datasets/raw_trajectories_A.pkl` 파일을 생성하고, 시각화는 `artifacts/A/visualizations/`에 저장됩니다.*
 
 ### 2단계: 선호도 데이터셋 구축
 
-다음으로, 생성된 원본 궤적들을 선호도 데이터셋으로 가공합니다. 이 스크립트는 특징 기반 클러스터링(K-Means)을 사용하여 다양한 사용자 그룹을 시뮬레이션하고, 각 클러스터별 점수 함수에 따라 쌍대 비교 레이블을 생성합니다.
+다음으로, 생성된 원본 궤적들을 선호도 데이터셋으로 가공합니다. K-Means를 제거하고, 200명의 가상 유저 가중치 벡터를 생성한 뒤 각 유저의 dot-product 점수로 쌍대 비교 레이블을 만듭니다. 피처는 정규화(`StandardScaler`) 후 사용됩니다.
 
 ```bash
-# 예시: 16개의 클러스터와 20,000개의 선호도 쌍으로 데이터셋 생성 (시각화 포함)
 python scripts/build_preference_dataset.py \
     --input_path artifacts/A/datasets/raw_trajectories_A.pkl \
     --output_path datasets/preference_dataset_A.pkl \
-    --num_clusters 16 \
     --num_pairs 20000 \
     --visualize
 ```
@@ -59,7 +60,7 @@ python scripts/build_preference_dataset.py \
 
 ### 3단계: VAE 모델 사전 학습
 
-이전 단계에서 생성한 선호도 데이터셋으로 VAE 모델(인코더 `q_ψ`와 디코더 `r_φ`)을 학습시킵니다. 학습 과정은 Weights & Biases를 통해 기록되며, 학습 곡선은 로컬 파일로도 저장됩니다.
+이전 단계에서 생성한 선호도 데이터셋으로 VAE 모델(인코더 `q_ψ`, residual 보상 디코더 `r_φ = g+h`)을 학습시킵니다. 학습 과정은 Weights & Biases를 통해 기록되며, 학습 곡선은 로컬 파일로도 저장됩니다. 기본값: `context_size=15`, `annealer_cycles=1`.
 
 ```bash
 # 먼저 wandb에 로그인해야 합니다: wandb login
@@ -69,7 +70,6 @@ python scripts/train_model.py \
     --comment "pretrain_suspension_model_A" \
     --seed 42 \
     --latent_dim 8 \
-    --context_size 5 \
     --save_training_curves True
 ```
 
@@ -126,11 +126,10 @@ python scripts/evaluate_adaptation.py \
 
 - **데이터 생성**: `artifacts/{dataset_id}/visualizations/`
   - `trajectory_samples.png`: 궤적 샘플 (6개)
-  - `feature_distributions.png`: 특징 분포 (jerk, pitch, settling_time)
+  - `feature_distributions.png`: 특징 분포 (jerk, pitch, settling_time, rms_acceleration)
 
 - **선호도 데이터셋**: `datasets/visualizations/`
-  - `clustering_results.png`: 클러스터링 결과 (PCA 투영, 클러스터 크기)
-  - `preference_distribution.png`: 선호도 쌍 분포
+  - `preference_distribution.png`: 선호도 쌍 분포 (가중치 오라클 기준)
 
 - **모델 학습**: `logs/{env}/{model_type}/{comment}/s{seed}/`
   - `training_curves.png`: 학습 곡선 (Loss, Accuracy, KL Divergence, KL Weight)

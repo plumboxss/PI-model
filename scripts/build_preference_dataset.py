@@ -25,19 +25,33 @@ def main(args):
     # 피처 이름은 get_trajectory_features 함수가 반환하는 키와 일치해야 합니다.
     # src/utils/simulation_utils.py에서 반환하는 키: "jerk", "pitch", "settling_time", "rms_acceleration"
     feature_names = ['jerk', 'pitch', 'settling_time', 'rms_acceleration']
-    for i in sorted(raw_data.keys()):
-        result = raw_data[i]
-        if 'features' in result and result['features'] is not None:
+    # robust iteration: allow list, dict, etc.
+    if isinstance(raw_data, dict):
+        iterable = sorted(raw_data.items(), key=lambda x: x[0])
+    elif isinstance(raw_data, list):
+        iterable = enumerate(raw_data)
+    else:
+        raise ValueError(f"Unsupported raw_data type: {type(raw_data)}")
+
+    for i, result in iterable:
+        # Guard against malformed entries
+        if not isinstance(result, dict):
+            print(f"Warning: Trajectory {i} is not a dict (type={type(result)}); skipping.")
+            continue
+        feats = result.get('features', None)
+        if feats is not None and isinstance(feats, dict):
             # Check if all features are present
-            if all(k in result['features'] for k in feature_names):
-                feature_vector = np.array([result['features'][k] for k in feature_names])
+            if all(k in feats for k in feature_names):
+                feature_vector = np.array([feats[k] for k in feature_names])
                 features_list.append(feature_vector)
                 trajectories.append({
-                    'observations': result['state'],
-                    'actions': result['action'],
+                    'observations': result.get('state'),
+                    'actions': result.get('action'),
                 })
             else:
-                print(f"Warning: Trajectory {i} missing features. Keys found: {result['features'].keys()}")
+                print(f"Warning: Trajectory {i} missing features. Keys found: {feats.keys()}")
+        else:
+            print(f"Warning: Trajectory {i} has no usable 'features'; skipping.")
     
     features_matrix = np.array(features_list)
     print(f"Extracted {len(trajectories)} trajectories with features.")
@@ -49,10 +63,20 @@ def main(args):
     
     # 원본 궤적 데이터에서 시간 정보를 가져와 settling time을 타임스텝 인덱스로 변환
     settling_time_indices = []
-    for i, result in enumerate(sorted(raw_data.keys())):
-        if 'features' in result and result['features'] is not None:
-            if all(k in result['features'] for k in feature_names):
-                time_array = np.array(result['time'])
+    def iter_raw():
+        if isinstance(raw_data, dict):
+            return sorted(raw_data.items(), key=lambda x: x[0])
+        elif isinstance(raw_data, list):
+            return enumerate(raw_data)
+        return []
+
+    for i, result in iter_raw():
+        if not isinstance(result, dict):
+            continue
+        feats = result.get('features', None)
+        if feats is not None and isinstance(feats, dict):
+            if all(k in feats for k in feature_names):
+                time_array = np.array(result.get('time', []))
                 settling_time = settling_times[len(settling_time_indices)]
                 
                 # settling time에 해당하는 타임스텝 인덱스 찾기
@@ -105,32 +129,35 @@ def main(args):
     print(f"All trajectories will be truncated to meaningful length of {meaningful_length} timesteps.")
     print(f"  This removes post-settling data that could cause KL loss collapse.")
 
-    for _ in tqdm(range(args.num_pairs)):
-        # a. 무작위로 두 개의 서로 다른 궤적 선택
-        idx1, idx2 = np.random.choice(num_trajectories, 2, replace=False)
-        
-        # b. 가상 유저 선택 및 점수 계산
-        user_id = np.random.randint(0, num_users)
+    # 유저별 균등 쿼터: 총 num_pairs를 num_users로 나눠 각 유저가 동일한 학습 기회를 가짐
+    pairs_per_user = args.num_pairs // num_users
+    remainder = args.num_pairs % num_users
+
+    for user_id in tqdm(range(num_users), desc="Generating pairs per user"):
+        quota = pairs_per_user + (1 if user_id < remainder else 0)  # 나머지를 앞쪽 유저에게 1개씩 배분
         w = user_weights[user_id]
-        score1 = float(np.dot(w, features_scaled[idx1]))
-        score2 = float(np.dot(w, features_scaled[idx2]))
 
-        # c. 점수가 더 높은 궤적이 선호됨
-        if score1 >= score2:
-            pref_traj, non_pref_traj = trajectories[idx1], trajectories[idx2]
-        else:
-            pref_traj, non_pref_traj = trajectories[idx2], trajectories[idx1]
-        label = 1.0
+        for _ in range(quota):
+            # a. 무작위로 두 개의 서로 다른 궤적 선택
+            idx1, idx2 = np.random.choice(num_trajectories, 2, replace=False)
 
-        # f. 데이터셋에 추가 (유의미한 길이로 통일, settling time 이후 데이터 제거)
-        final_dataset['observations'].append(pref_traj['observations'][:meaningful_length])
-        final_dataset['actions'].append(pref_traj['actions'][:meaningful_length])
-        
-        final_dataset['observations_2'].append(non_pref_traj['observations'][:meaningful_length])
-        final_dataset['actions_2'].append(non_pref_traj['actions'][:meaningful_length])
+            # b. 점수 계산
+            score1 = float(np.dot(w, features_scaled[idx1]))
+            score2 = float(np.dot(w, features_scaled[idx2]))
 
-        final_dataset['labels'].append(label)
-        final_dataset['model_id'].append(user_id)
+            # c. 점수가 더 높은 궤적을 label=1로, 순서는 유지
+            label = 1.0 if score1 >= score2 else 0.0
+            traj1, traj2 = trajectories[idx1], trajectories[idx2]
+
+            # d. 데이터셋에 추가 (유의미한 길이로 통일, settling time 이후 데이터 제거)
+            final_dataset['observations'].append(traj1['observations'][:meaningful_length])
+            final_dataset['actions'].append(traj1['actions'][:meaningful_length])
+            
+            final_dataset['observations_2'].append(traj2['observations'][:meaningful_length])
+            final_dataset['actions_2'].append(traj2['actions'][:meaningful_length])
+
+            final_dataset['labels'].append(label)
+            final_dataset['model_id'].append(user_id)
 
     # 6. 최종 데이터셋 형식 변환 및 저장
     print("Converting to final format and saving...")
