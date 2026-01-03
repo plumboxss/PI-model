@@ -1,0 +1,20 @@
+# Core ML & Data Handling
+# torch, torchvision, torchaudio: Please install manually using:
+# For GPU (CUDA 12.1): pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+# For CPU: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+numpy<2.0.0
+pandas
+scikit-learn
+
+# Environment & Simulation
+gym==0.26.2
+numba
+
+# Utilities
+absl-py
+cloudpickle
+matplotlib
+PyYAML
+tqdm
+wandb
+ml_collections
