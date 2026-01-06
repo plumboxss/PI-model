@@ -35,7 +35,7 @@ FLAGS_DEF = define_flags_with_default(
     lr=1e-3,
     model_type="VAE",  # VAE로 고정
     # Encoder types
-    trajectory_encoder_type='transformer',  # 'transformer', 'lstm', 'mlp'
+    trajectory_encoder_type='mlp',  # 'transformer', 'lstm', 'mlp'
     set_encoder_type='attention',  # 'attention', 'deepset'
     hidden_dim=256,
     n_heads=4,
@@ -47,7 +47,7 @@ FLAGS_DEF = define_flags_with_default(
     use_annealing=True, # 기본값 변경: False -> True
     annealer_baseline=0.0,
     annealer_type="cosine",
-    annealer_cycles=1,
+    annealer_cycles=4,
     # Training
     n_epochs=500,
     eval_freq=50,
@@ -62,7 +62,7 @@ FLAGS_DEF = define_flags_with_default(
     # plotting
     debug_plots=False,
     plot_observations=False,
-    reward_scaling=1.0,
+    reward_scaling=1000.0,
     # biased
     biased_mode="grid",
     comment="", # Add comment flag

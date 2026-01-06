@@ -12,16 +12,21 @@ class RewardDecoder(nn.Module):
 
         # Common net g(obs, act)
         common_input_dim = obs_dim + act_dim
+        common_hidden = 64  # bottleneck to force reliance on personal net
+        self.common_norm = nn.LayerNorm(common_input_dim)
         self.common_net = nn.Sequential(
-            nn.Linear(common_input_dim, hidden_dim),
+            nn.Linear(common_input_dim, common_hidden),
             nn.LeakyReLU(0.2),
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Dropout(p=0.3),
+            nn.Linear(common_hidden, common_hidden),
             nn.LeakyReLU(0.2),
-            nn.Linear(hidden_dim, output_dim),
+            nn.Dropout(p=0.3),
+            nn.Linear(common_hidden, output_dim),
         )
 
         # Personal net h(obs, act, z)
         personal_input_dim = obs_dim + act_dim + latent_dim
+        self.personal_norm = nn.LayerNorm(personal_input_dim)
         self.personal_net = nn.Sequential(
             nn.Linear(personal_input_dim, 128),
             nn.LeakyReLU(0.2),
@@ -52,6 +57,10 @@ class RewardDecoder(nn.Module):
         
         common_input = torch.cat([obs, act], dim=-1)  # (B, T, obs+act)
         personal_input = torch.cat([obs, act, z], dim=-1)  # (B, T, obs+act+z)
+
+        # LayerNorm at the input level to reduce scale disparity (e.g., velocity vs position)
+        common_input = self.common_norm(common_input)
+        personal_input = self.personal_norm(personal_input)
 
         r_common = self.common_net(common_input)   # (B, T, 1)
         r_personal = self.personal_net(personal_input)  # (B, T, 1)
