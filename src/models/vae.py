@@ -108,6 +108,8 @@ class VAEModel(nn.Module):
         Returns:
             z: (B, latent_dim)
         """
+        # Prevent variance blow-up / collapse
+        log_var = torch.clamp(log_var, min=-10.0, max=2.0)
         std = torch.exp(0.5 * log_var)
         epsilon = torch.randn_like(std)
         z = mean + std * epsilon

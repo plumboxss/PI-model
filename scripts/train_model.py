@@ -46,8 +46,8 @@ FLAGS_DEF = define_flags_with_default(
     learned_prior=False,
     use_annealing=True, # 기본값 변경: False -> True
     annealer_baseline=0.0,
-    annealer_type="logistic",
-    annealer_cycles=1,
+    annealer_type="cosine",
+    annealer_cycles=2,
     # Training
     n_epochs=500,
     eval_freq=50,
