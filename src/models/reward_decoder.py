@@ -12,15 +12,16 @@ class RewardDecoder(nn.Module):
 
         # Common net g(obs, act)
         common_input_dim = obs_dim + act_dim
-        common_hidden = 64  # bottleneck to force reliance on personal net
+        common_hidden = 32  # bottleneck to force reliance on personal net
         self.common_norm = nn.LayerNorm(common_input_dim)
+        # NOTE: Common net intentionally unused to force reliance on personal net (z-dependent)
         self.common_net = nn.Sequential(
             nn.Linear(common_input_dim, common_hidden),
             nn.LeakyReLU(0.2),
-            nn.Dropout(p=0.3),
+            nn.Dropout(p=0.5),
             nn.Linear(common_hidden, common_hidden),
             nn.LeakyReLU(0.2),
-            nn.Dropout(p=0.3),
+            nn.Dropout(p=0.5),
             nn.Linear(common_hidden, output_dim),
         )
 
@@ -37,6 +38,8 @@ class RewardDecoder(nn.Module):
 
         # Initialize personal head to near-zero so g dominates at start
         personal_out = self.personal_net[-1]
+        nn.init.constant_(personal_out.weight, 0.0)
+        nn.init.constant_(personal_out.bias, 0.0)
         nn.init.constant_(personal_out.weight, 0.0)
         nn.init.constant_(personal_out.bias, 0.0)
     
@@ -62,8 +65,9 @@ class RewardDecoder(nn.Module):
         common_input = self.common_norm(common_input)
         personal_input = self.personal_norm(personal_input)
 
-        r_common = self.common_net(common_input)   # (B, T, 1)
         r_personal = self.personal_net(personal_input)  # (B, T, 1)
 
-        r = r_common + r_personal
+        # Force reliance on personal_net (z-dependent); disable common_net contribution
+        # r_common = self.common_net(common_input)   # (B, T, 1)
+        r = r_personal
         return r

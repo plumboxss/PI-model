@@ -88,8 +88,8 @@ class TrajectoryEncoder(nn.Module):
             x = self.dropout(x)  # (B, T, hidden_dim)
             # Apply transformer
             x = self.transformer(x)  # (B, T, hidden_dim)
-            # Mean pooling over time
-            x = x.mean(dim=1)  # (B, hidden_dim)
+            # Max pooling over time to capture salient peaks
+            x, _ = torch.max(x, dim=1)  # (B, hidden_dim)
             # Final projection
             e = self.output_proj(x)  # (B, output_dim)
             # Verify output shape
@@ -98,15 +98,15 @@ class TrajectoryEncoder(nn.Module):
         elif self.encoder_type == 'lstm':
             # Apply LSTM
             lstm_out, (hidden, _) = self.lstm(tau)  # lstm_out: (B, T, hidden_dim*2)
-            # Use last hidden state (concatenated forward and backward)
-            x = torch.cat([hidden[-2], hidden[-1]], dim=1)  # (B, hidden_dim*2)
+            # Use max over time on bidirectional outputs to capture peaks
+            x, _ = torch.max(lstm_out, dim=1)  # (B, hidden_dim*2)
             # Final projection
             e = self.output_proj(x)  # (B, output_dim)
         else:  # MLP with temporal pooling
             # Apply MLP to each timestep
             x = self.mlp(tau)  # (B, T, hidden_dim)
-            # Mean pooling over time
-            x = x.mean(dim=1)  # (B, hidden_dim)
+            # Max pooling over time to capture salient peaks
+            x, _ = torch.max(x, dim=1)  # (B, hidden_dim)
             # Final projection
             e = self.output_proj(x)  # (B, output_dim)
         

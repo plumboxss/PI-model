@@ -44,6 +44,7 @@ python scripts/generate_data.py \
     --visualize
 ```
 *이 명령은 `artifacts/A/datasets/raw_trajectories_A.pkl` 파일을 생성하고, 시각화는 `artifacts/A/visualizations/`에 저장됩니다.*
+python scripts/generate_data.py --num-episodes 500 --dataset-id A --dataset-name raw_trajectories_A --visualize
 
 ### 2단계: 선호도 데이터셋 구축
 
@@ -57,6 +58,7 @@ python scripts/build_preference_dataset.py \
     --visualize
 ```
 *시각화는 `datasets/visualizations/`에 저장됩니다.*
+python scripts/build_preference_dataset.py --input_path artifacts/A/datasets/raw_trajectories_A.pkl --output_path datasets/preference_dataset_A.pkl --num_pairs 20000 --visualize
 
 ### 3단계: VAE 모델 사전 학습
 

@@ -100,12 +100,13 @@ def get_datasets(dataset_path, observation_dim, action_dim, batch_size=4, set_si
         else:
             print(f"⚠️  Warning: Test dataset context is not deterministic (this should not happen)")
     
-    # num_workers=0 is safer for Windows
+    # num_workers tuned for throughput; persistent_workers keeps workers alive
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=0,
+        num_workers=8,
+        persistent_workers=True,
         pin_memory=True,
         collate_fn=collate_context_query,
     )

@@ -41,13 +41,13 @@ FLAGS_DEF = define_flags_with_default(
     n_heads=4,
     n_layers=2,
     # VAE
-    latent_dim=8,
+    latent_dim=4,
     kl_weight=1.0,
     learned_prior=False,
     use_annealing=True, # 기본값 변경: False -> True
     annealer_baseline=0.0,
-    annealer_type="cosine",
-    annealer_cycles=4,
+    annealer_type="logistic",
+    annealer_cycles=2,
     # Training
     n_epochs=500,
     eval_freq=50,
@@ -56,13 +56,14 @@ FLAGS_DEF = define_flags_with_default(
     env='Suspension-v0', # Default env name to avoid flag error
     # Dataset
     dataset_path="",
-    context_size=15,  # Number of context comparisons (K)
+    context_size=30,  # Number of context comparisons (K)
     logging=WandBLogger.get_default_config(),
     # seed=42, # Duplicate seed definition removed
     # plotting
     debug_plots=False,
     plot_observations=False,
     reward_scaling=1000.0,
+    free_bits=0.5,  # KL free bits threshold
     # biased
     biased_mode="grid",
     comment="", # Add comment flag
@@ -152,6 +153,7 @@ def main(_):
         set_encoder_type=FLAGS.set_encoder_type,
         n_heads=FLAGS.n_heads,
         n_layers=FLAGS.n_layers,
+        free_bits=FLAGS.free_bits,
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

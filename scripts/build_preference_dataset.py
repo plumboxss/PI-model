@@ -106,11 +106,29 @@ def main(args):
     scaler = StandardScaler()
     features_scaled = scaler.fit_transform(features_matrix)
 
-    # 4. 가상 유저 생성 (feature-weighted oracle)
+    # 4. 가상 유저 생성 (feature-weighted oracle) - 명확한 상충 관계 그룹
     num_users = 200
     user_weights = []
-    for _ in range(num_users):
-        w = np.random.uniform(-1.0, 1.0, size=len(feature_names))
+    num_group_a = num_users // 2  # Jerk Haters
+    num_group_b = num_users - num_group_a  # Pitch Haters
+
+    for idx in range(num_users):
+        if idx < num_group_a:
+            # Group A: jerk / rms_acceleration를 강하게 싫어함, pitch / settling_time은 약한 가중치
+            w = np.array([
+                np.random.uniform(-1.0, -0.8),   # jerk
+                np.random.uniform(-0.1, 0.05),   # pitch (거의 무시, 소량 양수 허용)
+                np.random.uniform(-0.1, 0.05),   # settling_time (거의 무시)
+                np.random.uniform(-1.0, -0.8),   # rms_acceleration
+            ])
+        else:
+            # Group B: pitch / settling_time을 강하게 싫어함, jerk / rms_acceleration은 약한 가중치
+            w = np.array([
+                np.random.uniform(-0.1, 0.05),   # jerk (거의 무시)
+                np.random.uniform(-1.0, -0.8),   # pitch
+                np.random.uniform(-1.0, -0.8),   # settling_time
+                np.random.uniform(-0.1, 0.05),   # rms_acceleration (거의 무시)
+            ])
         norm = np.linalg.norm(w) + 1e-8
         user_weights.append(w / norm)
     user_weights = np.array(user_weights)

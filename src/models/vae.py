@@ -37,6 +37,7 @@ class VAEModel(nn.Module):
         n_layers=2,
         trajectory_embedding_dim=None,
         pair_embedding_dim=None,
+        free_bits: float = 0.5,
     ):
         super(VAEModel, self).__init__()
         self.obs_dim = obs_dim
@@ -47,6 +48,8 @@ class VAEModel(nn.Module):
         self.learned_prior = learned_prior
         self.annealer = annealer
         self.scaling = reward_scaling
+        # Free bits threshold: KL이 이 값 이하일 때는 벌점을 면제해 posterior collapse 완화
+        self.free_bits = free_bits
         
         # Trajectory embedding dimension (default: hidden_dim)
         traj_emb_dim = trajectory_embedding_dim if trajectory_embedding_dim is not None else hidden_dim
@@ -206,16 +209,19 @@ class VAEModel(nn.Module):
             prior_mean = self.prior_mean
             prior_log_var = self.prior_log_var
             # KL with learned prior
-            kl_loss = -0.5 * torch.sum(
+            kl_loss_raw = -0.5 * torch.sum(
                 1 + log_var - prior_log_var
                 - ((mean - prior_mean).pow(2) + log_var.exp()) / prior_log_var.exp()
             ) / mean.size(0)
         else:
             # Standard KL: KL(q(z|context) || N(0, I))
-            kl_loss = -0.5 * torch.sum(
+            kl_loss_raw = -0.5 * torch.sum(
                 1 + log_var - mean.pow(2) - log_var.exp()
             ) / mean.size(0)
-        
+
+        # Free bits 적용: kl_loss_raw가 임계값 이하이면 벌점을 주지 않는다.
+        kl_loss = torch.clamp(kl_loss_raw - self.free_bits, min=0.0)
+
         # Annealed KL weight
         kl_weight = self.annealer.slope() if self.annealer else self.kl_weight
         
@@ -231,6 +237,7 @@ class VAEModel(nn.Module):
             "loss": loss.item(),
             "reconstruction_loss": reconstruction_loss.item(),
             "kld_loss": kl_loss.item(),
+            "kld_loss_raw": kl_loss_raw.item(),
             "accuracy": accuracy.item(),
             "kl_weight": kl_weight
         }
