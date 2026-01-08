@@ -47,7 +47,7 @@ FLAGS_DEF = define_flags_with_default(
     use_annealing=True, # 기본값 변경: False -> True
     annealer_baseline=0.0,
     annealer_type="logistic",
-    annealer_cycles=2,
+    annealer_cycles=1,
     # Training
     n_epochs=500,
     eval_freq=50,
@@ -63,7 +63,7 @@ FLAGS_DEF = define_flags_with_default(
     debug_plots=False,
     plot_observations=False,
     reward_scaling=1000.0,
-    free_bits=0.5,  # KL free bits threshold
+    free_bits=0.0,  # KL free bits threshold
     # biased
     biased_mode="grid",
     comment="", # Add comment flag
