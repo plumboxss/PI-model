@@ -204,13 +204,19 @@ class ContextQueryDataset(Dataset):
         self.grouped_indices = grouped_indices
         self.group_ids = group_ids
         self.context_size = context_size
+        self.downsample_step = 5  # uniform temporal downsample (T -> T/5)
         self.deterministic_context = deterministic_context
         self.deterministic_seed = deterministic_seed
-        # 미리 평균/표준편차 계산 (x_com 제외: 앞 9차원)
+        # 미리 평균/표준편차 계산 (x_com 제외: 앞 9차원), 시간축 다운샘플 포함
         obs_all = np.array(pref_dataset['observations'])  # (N,1,T,D)
-        obs_all = obs_all[..., :9]
+        obs_all = obs_all[:, :, ::self.downsample_step, :9]
         self.obs_mean = obs_all.mean(axis=(0, 1, 2))
         self.obs_std = obs_all.std(axis=(0, 1, 2))
+        # Action 정규화 통계
+        act_all = np.array(pref_dataset['actions'])  # (N,1,T,act_dim)
+        act_all = act_all[:, :, ::self.downsample_step, :]
+        self.act_mean = act_all.mean(axis=(0, 1, 2))
+        self.act_std = act_all.std(axis=(0, 1, 2))
         
         # Track first call for verification logging
         self._first_call_verified = False
@@ -274,15 +280,18 @@ class ContextQueryDataset(Dataset):
         for ctx_idx in context_indices:
             real_idx = group_indices[ctx_idx]
             # Get data: (1, T, D) -> (T, D)
-            obs1 = self.pref_dataset['observations'][real_idx][0][..., :9]
-            act1 = self.pref_dataset['actions'][real_idx][0]
-            obs2 = self.pref_dataset['observations_2'][real_idx][0][..., :9]
-            act2 = self.pref_dataset['actions_2'][real_idx][0]
+            ds = slice(None, None, self.downsample_step)
+            obs1 = self.pref_dataset['observations'][real_idx][0][ds, :9]
+            act1 = self.pref_dataset['actions'][real_idx][0][ds]
+            obs2 = self.pref_dataset['observations_2'][real_idx][0][ds, :9]
+            act2 = self.pref_dataset['actions_2'][real_idx][0][ds]
             label = self.pref_dataset['labels'][real_idx][0]
 
             # Z-score 정규화 (x_com 제외 9D)
             obs1 = (obs1 - self.obs_mean) / (self.obs_std + 1e-8)
             obs2 = (obs2 - self.obs_mean) / (self.obs_std + 1e-8)
+            act1 = (act1 - self.act_mean) / (self.act_std + 1e-8)
+            act2 = (act2 - self.act_mean) / (self.act_std + 1e-8)
             
             # Concatenate obs and act
             s1 = np.concatenate([obs1, act1], axis=-1)  # (T, obs+act)
@@ -294,15 +303,18 @@ class ContextQueryDataset(Dataset):
         
         # Get query data
         query_real_idx = group_indices[query_idx]
-        query_obs1 = self.pref_dataset['observations'][query_real_idx][0][..., :9]
-        query_act1 = self.pref_dataset['actions'][query_real_idx][0]
-        query_obs2 = self.pref_dataset['observations_2'][query_real_idx][0][..., :9]
-        query_act2 = self.pref_dataset['actions_2'][query_real_idx][0]
+        ds = slice(None, None, self.downsample_step)
+        query_obs1 = self.pref_dataset['observations'][query_real_idx][0][ds, :9]
+        query_act1 = self.pref_dataset['actions'][query_real_idx][0][ds]
+        query_obs2 = self.pref_dataset['observations_2'][query_real_idx][0][ds, :9]
+        query_act2 = self.pref_dataset['actions_2'][query_real_idx][0][ds]
         query_label = self.pref_dataset['labels'][query_real_idx][0]
 
         # Z-score 정규화
         query_obs1 = (query_obs1 - self.obs_mean) / (self.obs_std + 1e-8)
         query_obs2 = (query_obs2 - self.obs_mean) / (self.obs_std + 1e-8)
+        query_act1 = (query_act1 - self.act_mean) / (self.act_std + 1e-8)
+        query_act2 = (query_act2 - self.act_mean) / (self.act_std + 1e-8)
         
         query_s1 = np.concatenate([query_obs1, query_act1], axis=-1)  # (T, obs+act)
         query_s2 = np.concatenate([query_obs2, query_act2], axis=-1)  # (T, obs+act)

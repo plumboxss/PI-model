@@ -49,6 +49,7 @@ class TrajectoryEncoder(nn.Module):
                 nn.LeakyReLU(0.2),
                 nn.Linear(hidden_dim, output_dim)
             )
+            self.attn_proj = nn.Linear(hidden_dim, 1)
         elif encoder_type == 'lstm':
             # LSTM-based encoder
             self.lstm = nn.LSTM(
@@ -62,6 +63,7 @@ class TrajectoryEncoder(nn.Module):
                 nn.LeakyReLU(0.2),
                 nn.Linear(hidden_dim, output_dim)
             )
+            self.attn_proj = nn.Linear(hidden_dim * 2, 1)
         else:  # 'mlp' or default
             # Simple MLP with temporal pooling
             self.mlp = nn.Sequential(
@@ -71,6 +73,7 @@ class TrajectoryEncoder(nn.Module):
                 nn.LeakyReLU(0.2),
             )
             self.output_proj = nn.Linear(hidden_dim, output_dim)
+            self.attn_proj = nn.Linear(hidden_dim, 1)
     
     def forward(self, tau):
         """
@@ -88,8 +91,10 @@ class TrajectoryEncoder(nn.Module):
             x = self.dropout(x)  # (B, T, hidden_dim)
             # Apply transformer
             x = self.transformer(x)  # (B, T, hidden_dim)
-            # Max pooling over time to capture salient peaks
-            x, _ = torch.max(x, dim=1)  # (B, hidden_dim)
+            # Attention pooling over time to focus on salient steps
+            attn_scores = self.attn_proj(x).squeeze(-1)  # (B, T)
+            attn_weights = torch.softmax(attn_scores, dim=1)
+            x = torch.sum(x * attn_weights.unsqueeze(-1), dim=1)  # (B, hidden_dim)
             # Final projection
             e = self.output_proj(x)  # (B, output_dim)
             # Verify output shape
@@ -98,15 +103,19 @@ class TrajectoryEncoder(nn.Module):
         elif self.encoder_type == 'lstm':
             # Apply LSTM
             lstm_out, (hidden, _) = self.lstm(tau)  # lstm_out: (B, T, hidden_dim*2)
-            # Use max over time on bidirectional outputs to capture peaks
-            x, _ = torch.max(lstm_out, dim=1)  # (B, hidden_dim*2)
+            # Attention pooling over time on bidirectional outputs
+            attn_scores = self.attn_proj(lstm_out).squeeze(-1)  # (B, T)
+            attn_weights = torch.softmax(attn_scores, dim=1)
+            x = torch.sum(lstm_out * attn_weights.unsqueeze(-1), dim=1)  # (B, hidden_dim*2)
             # Final projection
             e = self.output_proj(x)  # (B, output_dim)
         else:  # MLP with temporal pooling
             # Apply MLP to each timestep
             x = self.mlp(tau)  # (B, T, hidden_dim)
-            # Max pooling over time to capture salient peaks
-            x, _ = torch.max(x, dim=1)  # (B, hidden_dim)
+            # Attention pooling over time to capture salient steps
+            attn_scores = self.attn_proj(x).squeeze(-1)  # (B, T)
+            attn_weights = torch.softmax(attn_scores, dim=1)
+            x = torch.sum(x * attn_weights.unsqueeze(-1), dim=1)  # (B, hidden_dim)
             # Final projection
             e = self.output_proj(x)  # (B, output_dim)
         

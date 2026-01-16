@@ -20,13 +20,13 @@ class RewardDecoder(nn.Module):
             nn.Linear(hidden_dim, self.feature_dim),
         )
 
-        # Weight Network (psi): z -> hidden_dim -> feature_dim -> tanh
+        # Weight Network (psi): z -> hidden_dim -> feature_dim -> BatchNorm
         self.weight_net = nn.Sequential(
             nn.Linear(latent_dim, hidden_dim),
             nn.LeakyReLU(0.2),
             nn.Linear(hidden_dim, self.feature_dim),
-            nn.Tanh(),
         )
+        self.weight_bn = nn.BatchNorm1d(self.feature_dim)
 
     def forward(self, obs, act, z):
         """
@@ -42,6 +42,12 @@ class RewardDecoder(nn.Module):
         if z.dim() == 2:
             z = z.unsqueeze(1)  # (B, 1, z_dim) broadcasts over T
         weights = self.weight_net(z)  # (B, T or 1, feature_dim)
+        # BatchNorm expects (N, C); flatten time for normalization
+        if weights.dim() == 3:
+            B, T, F = weights.shape
+            weights = self.weight_bn(weights.reshape(B * T, F)).reshape(B, T, F)
+        else:
+            weights = self.weight_bn(weights)
 
         r = (features * weights).sum(dim=-1, keepdim=True)  # (B, T, 1)
         return r

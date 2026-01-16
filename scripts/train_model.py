@@ -13,6 +13,8 @@ import gym
 import numpy as np
 import torch
 import wandb
+from sklearn.metrics import roc_curve, auc
+import matplotlib.pyplot as plt
 
 from src.models.vae import VAEModel
 from src.data.loader import get_datasets
@@ -47,7 +49,7 @@ FLAGS_DEF = define_flags_with_default(
     use_annealing=True, # 기본값 변경: False -> True
     annealer_baseline=0.0,
     annealer_type="cosine",
-    annealer_cycles=2,
+    annealer_cycles=4,
     # Training
     n_epochs=500,
     eval_freq=50,
@@ -214,6 +216,8 @@ def main(_):
                 metrics[key].append(val)
 
         if epoch % FLAGS.eval_freq == 0:
+            roc_y_true = []
+            roc_y_score = []
             for batch in test_loader:
                 with torch.no_grad():
                     # Extract context and query data
@@ -232,6 +236,10 @@ def main(_):
                     for key, val in prefix_metrics(batch_metrics, "eval").items():
                         metrics[key].append(val)
 
+                    if "p_hat" in batch_metrics:
+                        roc_y_score.append(batch_metrics["p_hat"].detach().cpu().numpy())
+                        roc_y_true.append(query_y.detach().cpu().numpy())
+
             if FLAGS.debug_plots and "maze2d" in FLAGS.env:
                 fig_dict = putils.plot_vae(
                     gym_env,
@@ -242,6 +250,25 @@ def main(_):
                 metrics.update(prefix_metrics(fig_dict, "debug_plots"))
             else:
                 putils.update_posterior(gym_env, reward_model, eval_dataset)
+
+            if len(roc_y_true) > 0 and len(roc_y_score) > 0:
+                y_true = np.concatenate(roc_y_true, axis=0).reshape(-1)
+                y_score = np.concatenate(roc_y_score, axis=0).reshape(-1)
+                fpr, tpr, _ = roc_curve(y_true, y_score)
+                roc_auc = auc(fpr, tpr)
+                metrics["eval/roc_auc"] = roc_auc
+
+                roc_path = os.path.join(save_dir, f"roc_epoch_{epoch}.png")
+                plt.figure()
+                plt.plot(fpr, tpr, label=f"ROC AUC = {roc_auc:.3f}")
+                plt.plot([0, 1], [0, 1], "k--")
+                plt.xlabel("False Positive Rate")
+                plt.ylabel("True Positive Rate")
+                plt.title("ROC Curve")
+                plt.legend(loc="lower right")
+                plt.tight_layout()
+                plt.savefig(roc_path)
+                plt.close()
             
 
             criteria = np.mean(metrics["eval/loss"])

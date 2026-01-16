@@ -114,20 +114,20 @@ def main(args):
 
     for idx in range(num_users):
         if idx < num_group_a:
-            # Group A: jerk / rms_acceleration를 강하게 싫어함, pitch / settling_time은 약한 가중치
+            # Group A: jerk / rms_acceleration를 강하게 싫어함 (음수)
             w = np.array([
                 np.random.uniform(-1.0, -0.8),   # jerk
-                np.random.uniform(-0.1, 0.05),   # pitch (거의 무시, 소량 양수 허용)
-                np.random.uniform(-0.1, 0.05),   # settling_time (거의 무시)
+                np.random.uniform(-0.1, 0.1),    # pitch (거의 무시)
+                np.random.uniform(-0.1, 0.1),    # settling_time (거의 무시)
                 np.random.uniform(-1.0, -0.8),   # rms_acceleration
             ])
         else:
-            # Group B: pitch / settling_time을 강하게 싫어함, jerk / rms_acceleration은 약한 가중치
+            # Group B: pitch / settling_time을 강하게 선호 (양수)로 분포 반전
             w = np.array([
-                np.random.uniform(-0.1, 0.05),   # jerk (거의 무시)
-                np.random.uniform(-1.0, -0.8),   # pitch
-                np.random.uniform(-1.0, -0.8),   # settling_time
-                np.random.uniform(-0.1, 0.05),   # rms_acceleration (거의 무시)
+                np.random.uniform(-0.1, 0.1),    # jerk (거의 무시)
+                np.random.uniform(0.8, 1.0),     # pitch
+                np.random.uniform(0.8, 1.0),     # settling_time
+                np.random.uniform(-0.1, 0.1),    # rms_acceleration (거의 무시)
             ])
         norm = np.linalg.norm(w) + 1e-8
         user_weights.append(w / norm)
