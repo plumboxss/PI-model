@@ -161,7 +161,19 @@ def main(_):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     FLAGS.device = str(device)
     reward_model = reward_model.to(device)
-    optimizer = torch.optim.Adam(reward_model.parameters(), lr=FLAGS.lr)
+    # Use a lower LR for decoder to prevent it from overpowering the encoder
+    decoder_lr = FLAGS.lr * 0.2  # 1/5 of encoder LR
+    decoder_params = list(reward_model.reward_decoder.parameters())
+    encoder_params = [
+        p for name, p in reward_model.named_parameters()
+        if not name.startswith("reward_decoder.")
+    ]
+    optimizer = torch.optim.Adam(
+        [
+            {"params": encoder_params, "lr": FLAGS.lr},
+            {"params": decoder_params, "lr": decoder_lr},
+        ]
+    )
     early_stop = EarlyStopper(FLAGS.patience, FLAGS.min_delta)
     best_criteria = None
     # 전체 학습 히스토리 저장 (시각화용)
