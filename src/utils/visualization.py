@@ -213,16 +213,251 @@ def plot_preference_distribution(dataset: Dict, save_path: Optional[str] = None)
     # 2. Model ID 분포
     ax2 = axes[1]
     unique_model_ids, model_counts = np.unique(model_ids, return_counts=True)
-    ax2.bar(range(len(unique_model_ids)), model_counts, alpha=0.7, edgecolor='black')
-    ax2.set_xlabel('Model ID (User Group)')
+    n_users = len(unique_model_ids)
+    ax2.set_xlabel('User (model_id)')
     ax2.set_ylabel('Number of Pairs')
-    ax2.set_title('Preference Pairs per User Group')
-    ax2.set_xticks(range(len(unique_model_ids)))
-    ax2.set_xticklabels([f'G{i}' for i in unique_model_ids], rotation=45)
     ax2.grid(True, alpha=0.3, axis='y')
+    if n_users <= 30:
+        ax2.bar(range(n_users), model_counts, alpha=0.7, edgecolor='black')
+        ax2.set_title('Preference Pairs per User (by ID)')
+        ax2.set_xticks(range(n_users))
+        ax2.set_xticklabels([f'G{i}' for i in unique_model_ids], rotation=45)
+    else:
+        # Too many users: show distribution of counts rather than unreadable per-ID bars
+        ax2.hist(model_counts, bins=min(30, max(5, int(np.sqrt(n_users)))), alpha=0.7, edgecolor='black')
+        ax2.set_title('Preference Pairs per User (count distribution)')
+        ax2.text(
+            0.98,
+            0.98,
+            f"users={n_users}\nmin={int(model_counts.min())}\nmax={int(model_counts.max())}\nmean={model_counts.mean():.1f}",
+            transform=ax2.transAxes,
+            ha='right',
+            va='top',
+            fontsize=9,
+            bbox=dict(boxstyle='round', facecolor='white', alpha=0.8, edgecolor='gray')
+        )
     
     plt.tight_layout()
     
+    if save_path:
+        os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else '.', exist_ok=True)
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
+
+def plot_preference_oracle_diagnostics(
+    labels: np.ndarray,
+    model_ids: np.ndarray,
+    score_deltas: np.ndarray,
+    p_values: np.ndarray,
+    save_path: Optional[str] = None,
+    pair_temperature: Optional[float] = None,
+    margin_min: Optional[float] = None,
+    margin_max: Optional[float] = None,
+):
+    """
+    오라클 기반 선호 데이터셋 진단 플롯.
+    - Δscore 분포(난이도), p(y=1) 분포(노이즈), empirical P(y=1|Δ) (일관성), 유저별 라벨 편향
+    """
+    labels = np.asarray(labels).reshape(-1)
+    model_ids = np.asarray(model_ids).reshape(-1)
+    score_deltas = np.asarray(score_deltas).reshape(-1)
+    p_values = np.asarray(p_values).reshape(-1)
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+    # 1) |Δscore| (margin) distribution
+    ax = axes[0, 0]
+    abs_d = np.abs(score_deltas)
+    ax.hist(abs_d, bins=50, alpha=0.75, edgecolor='black')
+    if margin_min is not None:
+        ax.axvline(float(margin_min), color='r', linestyle='--', linewidth=2, label=f"margin_min={float(margin_min):.2f}")
+    if margin_max is not None:
+        ax.axvline(float(margin_max), color='g', linestyle='--', linewidth=2, label=f"margin_max={float(margin_max):.2f}")
+    ax.set_title('Pair Difficulty: |Δscore| Distribution')
+    ax.set_xlabel('|score1 - score2|')
+    ax.set_ylabel('Count')
+    ax.grid(True, alpha=0.3, axis='y')
+    ax.legend(loc='best')
+
+    # 2) p(y=1) distribution
+    ax = axes[0, 1]
+    ax.hist(p_values, bins=40, alpha=0.75, edgecolor='black', color='orange')
+    ax.axvline(float(np.mean(p_values)), color='r', linestyle='--', linewidth=2, label=f"mean={np.mean(p_values):.3f}")
+    ax.set_title('Oracle Stochasticity: p(y=1) Distribution')
+    ax.set_xlabel('p(y=1)')
+    ax.set_ylabel('Count')
+    ax.grid(True, alpha=0.3, axis='y')
+    ax.legend(loc='best')
+
+    # 3) empirical P(y=1 | Δscore) with optional theoretical sigmoid overlay
+    ax = axes[1, 0]
+    # bin deltas to reduce noise
+    n_bins = 25
+    lo, hi = np.percentile(score_deltas, [2, 98])
+    edges = np.linspace(lo, hi, n_bins + 1)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    emp = np.full(n_bins, np.nan, dtype=float)
+    counts = np.zeros(n_bins, dtype=int)
+    for i in range(n_bins):
+        m = (score_deltas >= edges[i]) & (score_deltas < edges[i + 1])
+        counts[i] = int(m.sum())
+        if counts[i] > 20:
+            emp[i] = float(labels[m].mean())
+    ax.plot(centers, emp, 'o-', label='empirical mean label', alpha=0.9)
+    if pair_temperature is not None and pair_temperature > 0:
+        T = float(pair_temperature)
+        xs = np.linspace(lo, hi, 200)
+        ys = 1.0 / (1.0 + np.exp(-xs / T))
+        ax.plot(xs, ys, '-', label=f'sigmoid(Δ/T), T={T:g}', alpha=0.8)
+    ax.set_title('Consistency: P(y=1 | Δscore)')
+    ax.set_xlabel('Δscore = score1 - score2')
+    ax.set_ylabel('P(y=1)')
+    ax.set_ylim(-0.05, 1.05)
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc='best')
+
+    # 4) per-user label mean distribution (bias)
+    ax = axes[1, 1]
+    unique_users = np.unique(model_ids)
+    user_means = []
+    user_counts = []
+    for u in unique_users:
+        m = model_ids == u
+        user_counts.append(int(m.sum()))
+        if m.sum() > 0:
+            user_means.append(float(labels[m].mean()))
+    user_means = np.array(user_means, dtype=float)
+    ax.hist(user_means, bins=30, alpha=0.75, edgecolor='black', color='green')
+    ax.axvline(float(np.mean(user_means)), color='r', linestyle='--', linewidth=2, label=f"mean={np.mean(user_means):.3f}")
+    ax.set_title('Per-user Label Bias: mean(y) over users')
+    ax.set_xlabel('mean label per user')
+    ax.set_ylabel('Number of users')
+    ax.grid(True, alpha=0.3, axis='y')
+    ax.legend(loc='best')
+
+    plt.suptitle('Preference Dataset Oracle Diagnostics', fontsize=16, fontweight='bold')
+    plt.tight_layout()
+
+    if save_path:
+        os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else '.', exist_ok=True)
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
+
+def plot_pair_overlap_diagnostics(
+    pair_idx1: np.ndarray,
+    pair_idx2: np.ndarray,
+    model_ids: np.ndarray,
+    save_path: Optional[str] = None,
+):
+    """
+    Cross-user overlap diagnostics.
+    Shows how many unique (i,j) pairs are shared across multiple users.
+    This is important when user preferences are very different: without shared comparisons,
+    learning a shared representation while using z can become unstable.
+    """
+    pair_idx1 = np.asarray(pair_idx1).reshape(-1)
+    pair_idx2 = np.asarray(pair_idx2).reshape(-1)
+    model_ids = np.asarray(model_ids).reshape(-1)
+    if not (pair_idx1.shape[0] == pair_idx2.shape[0] == model_ids.shape[0]):
+        raise ValueError("pair_idx1, pair_idx2, model_ids must have the same length")
+
+    # Canonicalize pairs (order-invariant)
+    i = np.minimum(pair_idx1, pair_idx2).astype(np.int64)
+    j = np.maximum(pair_idx1, pair_idx2).astype(np.int64)
+
+    # Count in how many distinct users each unique pair appears
+    # Approach: build (pair_key, user_id) tuples and unique them, then count per pair_key.
+    pair_key = i * (j.max() + 1) + j  # simple hash, safe for visualization
+    pair_user = np.stack([pair_key, model_ids.astype(np.int64)], axis=1)
+    pair_user_unique = np.unique(pair_user, axis=0)
+    unique_pair_keys, user_counts = np.unique(pair_user_unique[:, 0], return_counts=True)
+
+    # Summaries
+    total_unique_pairs = int(unique_pair_keys.shape[0])
+    shared_ge2 = int((user_counts >= 2).sum())
+    shared_ge5 = int((user_counts >= 5).sum())
+    shared_ratio = float(shared_ge2 / max(1, total_unique_pairs))
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    # 1) Histogram of user counts per unique pair
+    ax = axes[0]
+    bins = np.arange(1, max(3, int(user_counts.max()) + 2))
+    ax.hist(user_counts, bins=bins, alpha=0.75, edgecolor='black')
+    ax.set_title('Overlap: #Users per unique pair (i,j)')
+    ax.set_xlabel('number of distinct users that saw this pair')
+    ax.set_ylabel('number of unique pairs')
+    ax.grid(True, alpha=0.3, axis='y')
+
+    # 2) Text summary + bar for shared vs unique
+    ax = axes[1]
+    counts = np.array([total_unique_pairs - shared_ge2, shared_ge2], dtype=int)
+    ax.bar([0, 1], counts, alpha=0.75, edgecolor='black', color=['steelblue', 'orange'])
+    ax.set_xticks([0, 1])
+    ax.set_xticklabels(['seen by 1 user', 'seen by >=2 users'])
+    ax.set_ylabel('number of unique pairs')
+    ax.set_title('Shared vs non-shared pairs')
+    ax.grid(True, alpha=0.3, axis='y')
+    summary = (
+        f"unique_pairs={total_unique_pairs}\n"
+        f"shared(>=2 users)={shared_ge2} ({shared_ratio*100:.1f}%)\n"
+        f"shared(>=5 users)={shared_ge5}\n"
+        f"users={len(np.unique(model_ids))}"
+    )
+    ax.text(
+        0.98, 0.98, summary,
+        transform=ax.transAxes,
+        ha='right', va='top',
+        fontsize=10,
+        bbox=dict(boxstyle='round', facecolor='white', alpha=0.85, edgecolor='gray')
+    )
+
+    plt.suptitle('Pair Overlap Diagnostics', fontsize=16, fontweight='bold')
+    plt.tight_layout()
+
+    if save_path:
+        os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else '.', exist_ok=True)
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
+
+def plot_user_weight_heatmap(
+    user_weights: np.ndarray,
+    feature_names: List[str],
+    save_path: Optional[str] = None,
+    max_users: int = 80,
+):
+    """유저별 feature-space 가중치(w_user) 히트맵으로 다양성/구조를 빠르게 확인."""
+    W = np.asarray(user_weights, dtype=float)
+    if W.ndim != 2:
+        raise ValueError(f"user_weights must be 2D, got shape={W.shape}")
+    n_users, n_feat = W.shape
+    if n_feat != len(feature_names):
+        # don't crash hard; fallback to generic names
+        feature_names = feature_names[:n_feat] if len(feature_names) >= n_feat else [f"f{i}" for i in range(n_feat)]
+
+    if n_users > max_users:
+        # sample evenly to keep plot readable
+        idx = np.linspace(0, n_users - 1, max_users).astype(int)
+        W_plot = W[idx]
+        title_users = f"{max_users}/{n_users} users (subsampled)"
+    else:
+        W_plot = W
+        title_users = f"{n_users} users"
+
+    fig, ax = plt.subplots(1, 1, figsize=(10, 6))
+    im = ax.imshow(W_plot, aspect='auto', cmap='coolwarm', vmin=-1.0, vmax=1.0)
+    ax.set_title(f'User Preference Weights Heatmap ({title_users})')
+    ax.set_xlabel('Feature')
+    ax.set_ylabel('User index')
+    ax.set_xticks(range(len(feature_names)))
+    ax.set_xticklabels(feature_names, rotation=45, ha='right')
+    cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label('weight value')
+    plt.tight_layout()
+
     if save_path:
         os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else '.', exist_ok=True)
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
@@ -237,14 +472,26 @@ def plot_training_curves(metrics_history: Dict[str, List[float]], save_path: Opt
     """학습 곡선 시각화"""
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     
-    epochs = range(len(metrics_history.get('train/loss', [])))
+    # 어떤 메트릭은 eval_freq 등으로 인해 기록 횟수가 다를 수 있으므로,
+    # 제공된 시리즈 중 최대 길이를 epoch 축으로 사용하고 부족한 값은 NaN으로 패딩한다.
+    max_len = 0
+    for v in metrics_history.values():
+        if isinstance(v, list):
+            max_len = max(max_len, len(v))
+    epochs = range(max_len)
+    
+    def _padded_series(values: List[float], target_len: int) -> np.ndarray:
+        arr = np.array([np.nan if x is None else x for x in values], dtype=float)
+        if arr.shape[0] < target_len:
+            arr = np.concatenate([arr, np.full(target_len - arr.shape[0], np.nan)])
+        return arr
     
     # 1. Loss
     ax1 = axes[0, 0]
     if 'train/loss' in metrics_history:
-        ax1.plot(epochs, metrics_history['train/loss'], label='Train Loss', alpha=0.7)
+        ax1.plot(epochs, _padded_series(metrics_history['train/loss'], max_len), label='Train Loss', alpha=0.7)
     if 'eval/loss' in metrics_history:
-        ax1.plot(epochs, metrics_history['eval/loss'], label='Eval Loss', alpha=0.7)
+        ax1.plot(epochs, _padded_series(metrics_history['eval/loss'], max_len), label='Eval Loss', alpha=0.7)
     ax1.set_xlabel('Epoch')
     ax1.set_ylabel('Loss')
     ax1.set_title('Training Loss')
@@ -254,9 +501,9 @@ def plot_training_curves(metrics_history: Dict[str, List[float]], save_path: Opt
     # 2. Accuracy
     ax2 = axes[0, 1]
     if 'train/accuracy' in metrics_history:
-        ax2.plot(epochs, metrics_history['train/accuracy'], label='Train Accuracy', alpha=0.7)
+        ax2.plot(epochs, _padded_series(metrics_history['train/accuracy'], max_len), label='Train Accuracy', alpha=0.7)
     if 'eval/accuracy' in metrics_history:
-        ax2.plot(epochs, metrics_history['eval/accuracy'], label='Eval Accuracy', alpha=0.7)
+        ax2.plot(epochs, _padded_series(metrics_history['eval/accuracy'], max_len), label='Eval Accuracy', alpha=0.7)
     ax2.set_xlabel('Epoch')
     ax2.set_ylabel('Accuracy')
     ax2.set_title('Accuracy')
@@ -266,13 +513,13 @@ def plot_training_curves(metrics_history: Dict[str, List[float]], save_path: Opt
     # 3. KL Divergence
     ax3 = axes[1, 0]
     if 'train/kld_loss' in metrics_history:
-        ax3.plot(epochs, metrics_history['train/kld_loss'], label='Train KL', alpha=0.7)
+        ax3.plot(epochs, _padded_series(metrics_history['train/kld_loss'], max_len), label='Train KL', alpha=0.7)
     if 'eval/kld_loss' in metrics_history:
-        ax3.plot(epochs, metrics_history['eval/kld_loss'], label='Eval KL', alpha=0.7)
+        ax3.plot(epochs, _padded_series(metrics_history['eval/kld_loss'], max_len), label='Eval KL', alpha=0.7)
     if 'train/kld_loss_raw' in metrics_history:
-        ax3.plot(epochs, metrics_history['train/kld_loss_raw'], label='Train KL (raw)', alpha=0.7, linestyle='--')
+        ax3.plot(epochs, _padded_series(metrics_history['train/kld_loss_raw'], max_len), label='Train KL (raw)', alpha=0.7, linestyle='--')
     if 'eval/kld_loss_raw' in metrics_history:
-        ax3.plot(epochs, metrics_history['eval/kld_loss_raw'], label='Eval KL (raw)', alpha=0.7, linestyle='--')
+        ax3.plot(epochs, _padded_series(metrics_history['eval/kld_loss_raw'], max_len), label='Eval KL (raw)', alpha=0.7, linestyle='--')
     ax3.set_xlabel('Epoch')
     ax3.set_ylabel('KL Divergence')
     ax3.set_title('KL Divergence Loss')
@@ -282,7 +529,7 @@ def plot_training_curves(metrics_history: Dict[str, List[float]], save_path: Opt
     # 4. KL Weight (Annealing)
     ax4 = axes[1, 1]
     if 'train/kl_weight' in metrics_history:
-        ax4.plot(epochs, metrics_history['train/kl_weight'], label='KL Weight', alpha=0.7, color='green')
+        ax4.plot(epochs, _padded_series(metrics_history['train/kl_weight'], max_len), label='KL Weight', alpha=0.7, color='green')
     ax4.set_xlabel('Epoch')
     ax4.set_ylabel('KL Weight')
     ax4.set_title('KL Weight (Annealing)')

@@ -5,7 +5,7 @@ import pickle
 
 import torch
 from torch.utils.data import DataLoader, Dataset
-from tqdm import tqdm
+# tqdm is optional; loader does not require it at runtime.
 
 def get_model_id_and_train_test_split(dataset, train_split_path, test_split_path, num_models_to_use=None):
     """

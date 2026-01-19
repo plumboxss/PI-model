@@ -6,7 +6,11 @@ import tempfile
 import os
 from copy import copy
 from socket import gethostname
-import cloudpickle as pickle
+try:
+    import cloudpickle as pickle
+except Exception:
+    # Fallback for minimal environments
+    import pickle
 
 import numpy as np
 

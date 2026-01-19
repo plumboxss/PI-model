@@ -40,6 +40,7 @@ class VAEModel(nn.Module):
         trajectory_embedding_dim=None,
         pair_embedding_dim=None,
         free_bits: float = 0.5,
+        kl_warmup_epochs: int = 0,
     ):
         super(VAEModel, self).__init__()
         self.obs_dim = obs_dim
@@ -54,6 +55,14 @@ class VAEModel(nn.Module):
         # Free bits (KL floor) in nats per latent dimension.
         # When enabled (>0), this discourages posterior collapse by keeping per-dim KL from going to 0.
         self.free_bits = free_bits
+
+        # Optional KL warmup: keep KL weight at 0 for the first N epochs.
+        # This helps when reconstruction signal is initially weak (p_hat ~ 0.5), preventing the encoder from
+        # immediately collapsing to the prior before the decoder/encoders learn any signal.
+        self.kl_warmup_epochs = int(kl_warmup_epochs) if kl_warmup_epochs is not None else 0
+        if self.kl_warmup_epochs < 0:
+            raise ValueError("kl_warmup_epochs must be >= 0")
+        self._current_epoch = 0
         
         # Trajectory embedding dimension (default: hidden_dim)
         traj_emb_dim = trajectory_embedding_dim if trajectory_embedding_dim is not None else hidden_dim
@@ -103,6 +112,10 @@ class VAEModel(nn.Module):
         else:
             self.register_buffer('prior_mean', torch.zeros(latent_dim))
             self.register_buffer('prior_log_var', torch.zeros(latent_dim))
+
+    def set_epoch(self, epoch: int):
+        """Set current epoch for KL warmup scheduling."""
+        self._current_epoch = int(epoch)
     
     def reparameterization(self, mean, log_var):
         """
@@ -200,15 +213,23 @@ class VAEModel(nn.Module):
         R1 = r1.sum(dim=1) / self.scaling  # (B, 1)
         R2 = r2.sum(dim=1) / self.scaling  # (B, 1)
         
-        # 5. Bradley-Terry model: p = sigmoid(R1 - R2)
-        p_hat = torch.sigmoid(R1 - R2)  # (B, 1)
+        # 5. Bradley-Terry model in logit space: logits = (R1 - R2)
+        # Use BCE-with-logits for numerical stability.
+        logits = (R1 - R2)  # (B, 1)
+        # Guard against NaN/Inf which can trigger CUDA device-side asserts inside BCE kernels.
+        nan_or_inf = ~torch.isfinite(logits)
+        nan_logits_frac = nan_or_inf.float().mean()
+        if nan_or_inf.any():
+            logits = torch.nan_to_num(logits, nan=0.0, posinf=20.0, neginf=-20.0)
+        # For metrics/ROC only (do not use for loss)
+        p_hat = torch.sigmoid(logits)  # (B, 1)
         
         # 6. Compute losses
-        # Reconstruction loss (BCE)
-        reconstruction_loss = F.binary_cross_entropy(
-            p_hat.view(-1, 1),
+        # Reconstruction loss (stable): BCEWithLogits(logits, y)
+        reconstruction_loss = F.binary_cross_entropy_with_logits(
+            logits.view(-1, 1),
             query_y.view(-1, 1),
-            reduction='mean'
+            reduction='mean',
         )
         
         # KL divergence loss: KL(q(z|context) || p(z))
@@ -240,7 +261,10 @@ class VAEModel(nn.Module):
             kl_loss = kl_loss_raw
 
         # Annealed KL weight
-        kl_weight = self.annealer.slope() if self.annealer else self.kl_weight
+        if self.kl_warmup_epochs and self._current_epoch < self.kl_warmup_epochs:
+            kl_weight = 0.0
+        else:
+            kl_weight = self.annealer.slope() if self.annealer else self.kl_weight
         # Hard cap to prevent KL term from overpowering and collapsing posterior
         if self.kl_max is not None:
             kl_weight = min(float(kl_weight), float(self.kl_max))
@@ -260,6 +284,7 @@ class VAEModel(nn.Module):
             "kld_loss_raw": kl_loss_raw.item(),
             "accuracy": accuracy.item(),
             "kl_weight": kl_weight,
+            "nan_logits_frac": float(nan_logits_frac.detach().cpu().item()),
             # For ROC computation in eval (do not log directly)
             "p_hat": p_hat.detach()
         }

@@ -5,7 +5,7 @@
 이 프로젝트는 시뮬레이션된 차량의 서스펜션을 제어하기 위한 선호도 기반 보상 학습 시스템을 구현하고 평가합니다. 핵심 아이디어는 소수의 궤적 샘플 간 쌍대 비교 데이터로부터 잠재 선호도 벡터 `z`를 학습하고, 이를 조건부 보상 모델에 주입해 사용자 맞춤 보상을 추론하는 것입니다. 최근 업데이트로 다음이 반영되었습니다:
 
 - 시뮬레이션 다양성: PD+shaping 제어기(`kp/kd/shaping_factor`)와 범프 높이/폭 랜덤화, 승차감 지표(`rms_acceleration`) 추가
-- 데이터셋: K-Means 대신 가상 유저 200명의 가중치 기반 오라클(dot-product)로 라벨 생성
+- 데이터셋(업데이트): **연속(latent) 유저 선호 + 확률론(Bradley–Terry) 라벨 + margin 기반 pair 샘플링**으로 “쉬운 pair”를 줄여 `z`가 의미 있게 쓰이도록 데이터 신호를 강화
 - 모델: VAE 기반 잠재 선호 벡터 `z` 추론 + 선호도 조건부 보상 모델 `r(s, a, z)`
 - 학습(코드 기본값): `context_size=15`, `annealer_cycles=4`, `kl_max=0.5`
 
@@ -48,42 +48,53 @@ python scripts/generate_data.py \
 
 #### 2단계: 선호도 데이터셋 구축
 
-다음으로, 생성된 원본 궤적들을 선호도 데이터셋으로 가공합니다. K-Means를 제거하고, 200명의 가상 유저 가중치 벡터를 생성한 뒤 각 유저의 dot-product 점수로 쌍대 비교 레이블을 만듭니다. 피처는 정규화(`StandardScaler`) 후 사용됩니다.
+다음으로, 생성된 원본 궤적들을 선호도 데이터셋으로 가공합니다.
+
+- **유저 선호(연속 latent)**: 유저별 잠재 벡터 `z_user ~ N(0, I)`를 샘플링하고, 이를 feature-space 가중치 `w_user`로 매핑하여(정규화/센터링) 유저 선호가 연속적으로 변하도록 만듭니다.
+- **확률론 라벨(Bradley–Terry)**: 결정론 `1[score1>=score2]` 대신,
+  - \(p(y=1)=\sigma((score_1-score_2)/T)\) 로 두고 `Bernoulli(p)`로 라벨을 생성합니다(`T=pair_temperature`).
+- **margin 기반 pair 샘플링**: `|score1-score2|`가 특정 범위에 들어오는 pair를 우선적으로 생성해 **너무 쉬운 pair(전역 평균으로 맞추는 지름길)** 비중을 줄입니다.
 
 ```bash
 python scripts/build_preference_dataset.py \
   --input_path artifacts/A/datasets/raw_trajectories_A.pkl \
   --output_path datasets/preference_dataset_A.pkl \
   --num_pairs 20000 \
+  --seed 42 \
+  --num_users 200 \
+  --user_latent_dim 8 \
+  --pair_temperature 0.5 \
+  --margin_sampling_ratio 0.9 \
+  --margin_min 0.2 \
+  --margin_max 1.5 \
+  --margin_max_tries 80 \
   --visualize
 ```
-
+python scripts/build_preference_dataset.py \
+  --input_path artifacts/A/datasets/raw_trajectories_A.pkl \
+  --output_path datasets/preference_dataset_A_prob_margin_u50_p25k.pkl \
+  --num_pairs 25000 \
+  --seed 42 \
+  --num_users 50 \
+  --user_latent_dim 8 \
+  --pair_temperature 0.5 \
+  --margin_sampling_ratio 0.9 \
+  --margin_min 0.2 \
+  --margin_max 1.5 \
+  --margin_max_tries 80 \
+  --visualize
 시각화는 `datasets/visualizations/`에 저장됩니다.
 
-**(추가) disagreement pair 오버샘플링**
+**(참고) 핵심 플래그 요약**
 
-후방 붕괴(posterior collapse)를 줄이기 위해, 데이터셋 생성 시 **그룹 A(‘jerk hater’) vs 그룹 B(‘pitch hater’)가 서로 반대 선택을 할 법한 trajectory pair**를 더 자주 포함하도록 바이어스할 수 있습니다.
-
-- `--disagreement_oversample_ratio`: 전체 pair 중 disagreement pair를 “우선 탐색”할 비율 (기본 `0.5`, `0.0`이면 비활성화)
-- `--disagreement_max_tries`: disagreement pair를 찾기 위한 최대 시도 횟수(실패 시 랜덤 pair로 fallback, 기본 `50`)
-
-예시:
-
-```bash
-python scripts/build_preference_dataset.py \
-  --input_path artifacts/A/datasets/raw_trajectories_A.pkl \
-  --output_path datasets/preference_dataset_A.pkl \
-  --num_pairs 20000 \
-  --disagreement_oversample_ratio 0.8 \
-  --disagreement_max_tries 50 \
-  --visualize
-```
+- `--pair_temperature`: 작을수록 결정론에 가까워지고, 클수록 라벨 노이즈가 커집니다(너무 작으면 쉬운 데이터, 너무 크면 학습 불가능).
+- `--margin_*`: 쉬운 pair를 줄이는 핵심. `margin_min`을 올리면 더 어려워지고, `margin_max`를 너무 크게 하면 쉬운 pair가 다시 섞입니다.
 
 #### 3단계: VAE 모델 사전 학습
 
 이전 단계에서 생성한 선호도 데이터셋으로 VAE 모델(인코더 `q_ψ`, 보상 디코더 `r_φ`)을 학습시킵니다. 학습 과정은 Weights & Biases를 통해 기록되며, 학습 곡선은 로컬 파일로도 저장됩니다.
 
-- 코드 기본값(현재 `scripts/train_model.py` 기준): `context_size=15`, `annealer_cycles=4`, `trajectory_encoder_type=mlp`, `set_encoder_type=attention`, `reward_scaling=1000`, `free_bits=0.15`, `kl_max=0.5`, `decoder_feature_dropout=0.1`
+- 코드 기본값(현재 `scripts/train_model.py` 기준): `context_size=15`, `annealer_cycles=4`, `trajectory_encoder_type=mlp`, `set_encoder_type=attention`, `reward_scaling=200`, `free_bits=0.15`, `kl_max=0.5`, `decoder_feature_dropout=0.1`
 - 실험에서 다른 값을 쓰려면 아래처럼 플래그로 명시하세요(예: `context_size=15`, `annealer_cycles=1`)
 
 ```bash
@@ -95,11 +106,22 @@ python scripts/train_model.py \
   --seed 42 \
   --latent_dim 8 \
   --context_size 15 \
-  --annealer_cycles 1 \
+  --annealer_cycles 4 \
   --kl_max 0.5 \
-  --free_bits 0.0 \
+  --free_bits 0.15 \
   --save_training_curves True
 ```
+python scripts/train_model.py \
+  --dataset_path datasets/preference_dataset_A_prob_margin_viz.pkl \
+  --logging.output_dir "logs" \
+  --comment "pretrain_suspension_model_A" \
+  --seed 42 \
+  --latent_dim 4 \
+  --context_size 15 \
+  --annealer_cycles 4 \
+  --kl_max 0.5 \
+  --free_bits 0.15 \
+  --save_training_curves True
 
 학습된 모델(`model.pt` 등)이 `logs/` 디렉토리 내부에 저장되고, 학습 곡선은 `logs/{env}/{model_type}/{comment}/s{seed}/training_curves.png`에 자동 저장됩니다.
 
@@ -203,7 +225,9 @@ python scripts/evaluate_adaptation.py \
   - `trajectory_samples.png`: 궤적 샘플 (6개)
   - `feature_distributions.png`: 특징 분포 (`jerk`, `pitch`, `settling_time`, `rms_acceleration`)
 - **선호도 데이터셋**: `datasets/visualizations/`
-  - `preference_distribution.png`: 선호도 쌍 분포 (가중치 오라클 기준)
+  - `preference_distribution.png`: 라벨/유저별 pair 수 분포 요약
+  - `preference_oracle_diagnostics.png`: 오라클 진단(난이도 |Δscore|, p(y=1) 분포, P(y=1|Δscore) 정합성, 유저별 라벨 편향)
+  - `user_weight_heatmap.png`: 유저 선호 가중치(oracle `w_user`) 히트맵
 - **모델 학습**: `logs/{env}/{model_type}/{comment}/s{seed}/`
   - `training_curves.png`: 학습 곡선 (Loss, Accuracy, KL Divergence(`kld_loss` + `kld_loss_raw`), KL Weight)
 - **적응 단계**: `data/visualizations/`
@@ -226,6 +250,14 @@ python scripts/build_preference_dataset.py \
   --input_path artifacts/A/datasets/raw_trajectories_A.pkl \
   --output_path datasets/preference_dataset_A.pkl \
   --num_pairs 20000 \
+  --seed 42 \
+  --num_users 200 \
+  --user_latent_dim 8 \
+  --pair_temperature 0.5 \
+  --margin_sampling_ratio 0.9 \
+  --margin_min 0.2 \
+  --margin_max 1.5 \
+  --margin_max_tries 80 \
   --visualize
 
 # 3단계: 학습 곡선 자동 저장 (--save_training_curves True, 기본값)

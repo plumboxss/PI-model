@@ -44,7 +44,7 @@ FLAGS_DEF = define_flags_with_default(
     n_heads=4,
     n_layers=2,
     # VAE
-    latent_dim=4,
+    latent_dim=8,
     kl_weight=1.0,
     kl_max=0.5,  # Cap for annealed KL weight to mitigate posterior collapse
     learned_prior=False,
@@ -66,9 +66,10 @@ FLAGS_DEF = define_flags_with_default(
     # plotting
     debug_plots=False,
     plot_observations=False,
-    reward_scaling=1000.0,
+    reward_scaling=200.0,
     free_bits=0.15,  # KL floor (nats per latent dimension)
     decoder_feature_dropout=0.1,  # Weak dropout in RewardDecoder.feature_net
+    kl_warmup_epochs=10,  # Keep KL weight at 0 for first N epochs to avoid early collapse
     # biased
     biased_mode="grid",
     comment="", # Add comment flag
@@ -173,6 +174,7 @@ def main(_):
         annealer=annealer,
         reward_scaling=FLAGS.reward_scaling,
         decoder_feature_dropout=FLAGS.decoder_feature_dropout,
+        kl_warmup_epochs=FLAGS.kl_warmup_epochs,
         trajectory_encoder_type=FLAGS.trajectory_encoder_type,
         set_encoder_type=FLAGS.set_encoder_type,
         n_heads=FLAGS.n_heads,
@@ -184,7 +186,7 @@ def main(_):
     FLAGS.device = str(device)
     reward_model = reward_model.to(device)
     # Use a lower LR for decoder to prevent it from overpowering the encoder
-    decoder_lr = FLAGS.lr * 0.2  # 1/5 of encoder LR
+    decoder_lr = FLAGS.lr * 0.5  # 1/2 of encoder LR
     decoder_params = list(reward_model.reward_decoder.parameters())
     encoder_params = [
         p for name, p in reward_model.named_parameters()
@@ -200,8 +202,23 @@ def main(_):
     best_criteria = None
     # 전체 학습 히스토리 저장 (시각화용)
     metrics_history = defaultdict(list)
+    # 시각화에 사용할 메트릭 키(누락 epoch은 NaN으로 패딩해서 길이 정합성 유지)
+    tracked_history_keys = [
+        "train/loss",
+        "eval/loss",
+        "train/accuracy",
+        "eval/accuracy",
+        "train/kld_loss",
+        "eval/kld_loss",
+        "train/kld_loss_raw",
+        "eval/kld_loss_raw",
+        "train/kl_weight",
+    ]
     
     for epoch in range(FLAGS.n_epochs):
+        # Inform model of epoch for KL warmup scheduling
+        if hasattr(reward_model, "set_epoch"):
+            reward_model.set_epoch(epoch)
         metrics = defaultdict(list)
         metrics["epoch"] = epoch
 
@@ -240,6 +257,9 @@ def main(_):
                 context_s1, context_s2, context_y,
                 query_s1, query_s2, query_y
             )
+            # Warn if logits contained NaN/Inf (guarded inside model)
+            if isinstance(batch_metrics, dict) and batch_metrics.get("nan_logits_frac", 0.0) > 0.0:
+                print(f"⚠️  Warning: nan_logits_frac={batch_metrics['nan_logits_frac']:.4f} (logits had NaN/Inf; values were sanitized)")
             # Remove p_hat from logging metrics if present
             if "p_hat" in batch_metrics:
                 batch_metrics.pop("p_hat")
@@ -328,23 +348,30 @@ def main(_):
             torch.save(reward_model, save_dir + f"/model_{epoch}.pt")
 
         if FLAGS.use_annealing:
-            reward_model.annealer.step()
+            # If KL warmup is enabled, keep annealer at step=0 until warmup ends.
+            # This avoids starting KL ramp mid-way (which can look like a sudden change at warmup boundary).
+            if (not hasattr(FLAGS, "kl_warmup_epochs")) or (epoch >= int(FLAGS.kl_warmup_epochs)):
+                reward_model.annealer.step()
 
         log_metrics(metrics, epoch, wb_logger)
         
         # 메트릭 히스토리 업데이트 (시각화용)
-        for key, val in metrics.items():
-            if isinstance(val, list):
-                avg_val = np.mean(val)
+        # - eval 메트릭은 eval_freq에만 생성되므로, 누락된 epoch에는 NaN을 넣어
+        #   모든 시리즈 길이가 epoch 축과 동일하도록 맞춘다.
+        # - 시각화에 필요한 키만 기록해 디버그/플롯 객체 등 비수치 데이터로 인한 오류를 방지한다.
+        for key in tracked_history_keys:
+            if key in metrics:
+                val = metrics[key]
+                avg_val = np.mean(val) if isinstance(val, list) else val
+                metrics_history[key].append(float(avg_val))
             else:
-                avg_val = val
-            metrics_history[key].append(avg_val)
+                metrics_history[key].append(float("nan"))
         
         # 학습 곡선 로컬 저장 (마지막 epoch 또는 주기적으로)
         if FLAGS.save_training_curves and (epoch == FLAGS.n_epochs - 1 or epoch % FLAGS.save_freq == 0):
             from src.utils.visualization import plot_training_curves
             
-            # 메트릭 히스토리 준비 (eval 메트릭은 eval_freq에 맞춰 필터링)
+            # 메트릭 히스토리 준비
             plot_metrics = {}
             for key in ['train/loss', 'eval/loss', 'train/accuracy', 'eval/accuracy', 
                        'train/kld_loss', 'eval/kld_loss',

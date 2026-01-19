@@ -1,6 +1,17 @@
 import argparse
 import numpy as np
-from tqdm import tqdm
+try:
+    from tqdm import tqdm
+except Exception:
+    # Fallback when tqdm isn't installed (progress bar becomes a no-op iterator).
+    def tqdm(x=None, **kwargs):
+        if x is None:
+            class _Dummy:
+                def __enter__(self): return self
+                def __exit__(self, exc_type, exc, tb): return False
+                def update(self, n=1): pass
+            return _Dummy()
+        return x
 
 class SimulationRecorder:
     def __init__(self, env, controller, downsample=1):

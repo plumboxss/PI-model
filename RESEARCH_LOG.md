@@ -20,9 +20,9 @@
 
 ### 3) 오라클/데이터셋 리팩토링
 - K-Means 제거
-- feature-weighted oracle로 라벨링 전환
+- feature 기반 오라클로 라벨링 전환(선호 데이터 생성 파이프라인 확립)
 - 유저별 쿼터를 균등 분배(각 유저가 동일한 학습 기회)
-- Group A/B를 명확히 상충(trade-off)하도록 분리하고, 분포를 음수/양수로 반전하여 차이를 강화
+- (이전) Group A/B를 명확히 상충(trade-off)하도록 분리해 데이터 신호를 강화
 
 ### 4) 입력 스케일 문제 해결
 - 관측에서 `x_com` 제거
@@ -33,11 +33,11 @@
 - RewardDecoder를 residual 구조에서 **dot-product 구조**로 전면 변경
   - \(r(t)=\langle \phi(s_t,a_t), \psi(z)\rangle\)
   - `feature_dim=16`
-  - `weight_net` 출력에 BatchNorm 적용(tanh 제거)
+  - (업데이트) `psi(z)` 정규화는 **BatchNorm → LayerNorm**으로 교체(배치 통계로 z 정보가 씻기는 현상 완화)
 - TrajectoryEncoder의 pooling을 max/mean에서 **attention pooling**으로 변경
 
 ### 6) 학습 안정화 설정
-- `reward_scaling=1000`: sigmoid saturation 완화
+- `reward_scaling=200`: sigmoid 입력 \(R_1-R_2\) 스케일을 조절해 학습 신호(gradient) 품질을 확보
 - `latent_dim=4`, `context_size=15` (기본값을 30→15로 조정)
 - KL annealing: cosine, cycles=4
 - KL weight cap: `kl_max=0.5` (annealer 출력 상한)
@@ -48,11 +48,21 @@
 아래 변경들은 “KL이 1~2 epoch 만에 0으로 붕괴”되는 현상을 타개하기 위해, **데이터(신호) → 손실/규제(인센티브) → 평가(가시화)** 순서로 적용했습니다.
 
 #### 7.1 Disagreement pair 오버샘플링(데이터 측면 강화)
-- 목표: 유저 성향(A/B)이 다른 상황에서 **z 없이 동시에 설명이 어려운 쌍**을 더 자주 학습에 노출
+#### 7.1 오라클/데이터 생성 강화(2026-01-19): 연속 latent 유저 + 확률론 라벨 + margin 샘플링
+후방 붕괴의 근본 원인이 “**전역 평균(유저 무시)으로도 꽤 맞추는 쉬운 pair가 많음**”에 있다고 판단하여,
+데이터 생성 자체를 `z`가 **반드시 필요**하도록 바꾸었습니다.
+
+- 목표
+  - 쉬운 pair(Δscore가 너무 큰 비교)를 줄여 “컨텍스트 없이 맞추기 어려운” 샘플 비중을 증가
+  - 2그룹 평균으로 해결되는 지름길을 차단(유저 선호를 연속 공간으로)
+  - 라벨을 결정론이 아닌 Bradley–Terry 확률 모델로 생성해 난이도/노이즈를 조절 가능하게
 - 변경: `scripts/build_preference_dataset.py`
-  - `--disagreement_oversample_ratio` (기본 0.5)
-  - `--disagreement_max_tries` (기본 50)
-  - 그룹 A/B 프로토타입(평균 w)을 기준으로 “반대 선택이 발생하는 pair”를 우선적으로 찾고, 실패 시 랜덤 pair로 fallback
+  - **연속 유저 선호**: `z_user ~ N(0,I)` → `w_user`(feature-space)로 매핑 후 정규화/센터링
+    - `--num_users`, `--user_latent_dim`, `--seed`
+  - **확률론 라벨**: \(p(y=1)=\sigma((s_1-s_2)/T)\), `y~Bernoulli(p)`
+    - `--pair_temperature`
+  - **margin 기반 pair 샘플링**: `|s1-s2| ∈ [margin_min, margin_max]`를 우선적으로 만족하는 pair 생성
+    - `--margin_sampling_ratio`, `--margin_min`, `--margin_max`, `--margin_max_tries`
 
 #### 7.2 KL weight 상한(kl_max) 도입
 - 목표: KL 스케줄이 과도하게 커져 학습이 불안정해지거나, 반대로 인코더가 너무 빨리 prior로 수렴하는 상황을 완화

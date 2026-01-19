@@ -1,0 +1,285 @@
+학부연구 보고서(초안)
+차량 서스펜션 제어를 위한 선호도 기반 보상 모델(PI-model)
+
+작성자: (이름 기입)
+소속: (학과/연구실 기입)
+지도교수/지도연구원: (기입)
+작성일: 2026-01-19
+
+──────────────────────────────────────────────────────────────────────────────
+초록(Abstract)
+──────────────────────────────────────────────────────────────────────────────
+본 연구는 시뮬레이션 차량 서스펜션 제어 문제에서, 사용자의 주관적 선호를 반영한 보상 함수를 학습하기 위해 선호도(pairwise preference) 비교 데이터를 이용하는 보상 모델을 설계·구현하고 posterior collapse 문제를 완화하는 방법을 탐구하였다. 입력은 두 궤적 (τ_A, τ_B)와 선호 라벨 y∈{0,1}, 그리고 유저/오라클 식별자(model_id)로 구성되며, 목표는 K개의 비교 컨텍스트로부터 잠재 선호 벡터 z를 추론하는 인코더 q_ψ(z|context)와, z에 조건부인 보상 디코더 r_φ(s,a,z)를 학습하는 것이다. 학습은 Bradley–Terry 확률모형을 기반으로 하며, posterior collapse(인코더가 prior로 수렴하며 z가 무의미해지는 현상)를 중심 문제로 진단하였다. 이를 해결하기 위해 데이터 생성(연속 latent 유저, 확률론 라벨, margin 기반 pair 샘플링), 입력 전처리 일치(x_com 제거, Z-score, 시간축 다운샘플), 디코더 구조를 오라클과 정합적인 dot-product 형태로 변경, KL annealing 상한(kl_max), per-dimension free-bits(KL floor) 및 raw KL 가시화, 디코더 dropout, 적응 단계의 오라클 피드백/라벨 저장 개선 등을 단계적으로 적용하였다. 본 보고서는 위 변경들의 설계 의도와 구현 요점을 정리하고, 향후 z ablation 및 쌍비교 정량지표(AUC/BCE/Acc) 기반 검증 계획을 제시한다.
+
+키워드: 선호도 학습, Bradley–Terry, VAE, posterior collapse, personalized reward, 서스펜션 제어
+
+──────────────────────────────────────────────────────────────────────────────
+1. 서론(Introduction)
+──────────────────────────────────────────────────────────────────────────────
+1.1 연구 배경
+강화학습 기반 제어에서 보상 함수는 목표와 제약을 수치로 표현하는 핵심 요소이다. 그러나 실제 문제(승차감, 안정성 등)에서는 “좋음/나쁨”을 정량 보상으로 직접 설계하기 어렵고, 사용자의 선호가 사람마다 달라 보상 설계가 더 복잡해진다. 이에 따라, 사용자가 두 결과 중 어느 쪽을 더 선호하는지만 제공하는 선호 비교 데이터로부터 보상을 학습하는 접근이 필요하다.
+
+1.2 연구 목표
+본 연구의 목표는 다음과 같다.
+- (목표 1) 선호 비교 데이터로부터 개인화된 잠재 선호 벡터 z를 추론하는 인코더 q_ψ(z|context) 학습
+- (목표 2) z에 조건부인 보상 모델 r_φ(s,a,z) 학습 및 궤적 선호 확률 예측
+- (목표 3) 학습 중 posterior collapse를 진단하고, 데이터/모델/학습 규제 관점에서 완화 기법을 구현 및 검증
+
+1.3 연구 문제: posterior collapse
+VAE류 모델에서 posterior collapse는 인코더가 입력에 상관없이 prior에 가까운 분포를 출력하여 z가 사실상 사용되지 않는 현상이다. 본 프로젝트에서 posterior collapse가 쉽게 발생하는 조건은 다음과 같이 정리된다.
+- 디코더가 z 없이도 y를 잘 맞출 수 있는 “지름길”이 존재
+- 입력 스케일 불균형으로 작은 신호가 묻힘
+- sigmoid 포화로 reconstruction(분류) gradient가 약해짐
+- KL 압력이 상대적으로 강해져 q(z|c) → p(z)로 수렴
+
+──────────────────────────────────────────────────────────────────────────────
+2. 문제 정의 및 수식화(Problem Formulation)
+──────────────────────────────────────────────────────────────────────────────
+2.1 데이터 정의
+선호 비교 데이터셋 D는 다음 샘플들로 구성된다.
+- 두 궤적: τ_A, τ_B
+- 선호 라벨: y ∈ {0,1}  (예: y=1이면 τ_A ≻ τ_B)
+- 유저/오라클 ID: model_id
+
+2.2 Bradley–Terry 기반 선호 확률 모델
+각 궤적의 누적 보상을 R로 정의하고, 선호 확률을 시그모이드로 모델링한다.
+
+$$
+p(\tau_A \succ \tau_B) = \sigma(R_A - R_B)
+$$
+
+$$
+R = \sum_{t=1}^{T} r_\phi(s_t, a_t, z)
+$$
+
+학습 안정화를 위해 실제 구현에서는 (R_A - R_B)의 입력 스케일을 조절하는 reward_scaling을 사용한다.
+
+$$
+p(\tau_A \succ \tau_B) = \sigma\left(\frac{R_A - R_B}{\text{reward\_scaling}}\right)
+$$
+
+2.3 잠재 선호 벡터 z의 역할
+z는 사용자(또는 오라클)의 선호를 저차원 잠재 공간에 임베딩한 벡터이며, 인코더는 K개의 비교 컨텍스트로부터 z의 posterior를 추정한다.
+
+$$
+q_\psi(z \mid \text{context}) = \mathcal{N}(\mu_\psi(\text{context}), \operatorname{diag}(\sigma_\psi^2(\text{context})))
+$$
+
+재매개변수화는 다음과 같다.
+
+$$
+z = \mu + \sigma \odot \epsilon,\quad \epsilon \sim \mathcal{N}(0, I)
+$$
+
+──────────────────────────────────────────────────────────────────────────────
+3. 방법(Method)
+──────────────────────────────────────────────────────────────────────────────
+3.1 오라클 기반 데이터 생성(선호 라벨링)
+본 프로젝트는 “feature-weighted oracle”로 선호 라벨을 생성한다. 각 궤적 τ에서 스칼라 특징 f(τ)를 추출하며, 예시는 다음과 같다.
+- jerk
+- pitch
+- settling_time
+- rms_acceleration
+
+유저 i의 가중치 w_i를 생성하고(초기에는 A/B 상충 그룹으로 분리, 이후 연속 latent 유저로 확장), 점수는 다음과 같이 계산한다.
+
+$$
+\text{Score}_i(\tau) = w_i^\top \tilde f(\tau)
+$$
+
+여기서 \tilde f(τ)는 StandardScaler 등으로 정규화된 특징이다.
+
+3.2 (2026-01-19 업데이트) 연속 유저 + 확률론 라벨 + margin 샘플링
+posterior collapse의 근본 원인을 “전역 평균(유저 무시)로도 맞추는 쉬운 pair가 많음”으로 보고, 데이터 생성 자체가 z를 필요로 하도록 변경하였다.
+
+(1) 연속 latent 유저 선호
+$$
+z_{\text{user}} \sim \mathcal{N}(0, I)
+$$
+샘플된 z_user를 feature-space 가중치 w_user로 매핑 후 정규화/센터링하여 유저 선호가 연속적으로 분포하도록 구성한다.
+
+(2) Bradley–Terry 확률론 라벨
+결정론 라벨 대신 확률로 라벨을 생성하여 난이도/노이즈를 조절한다.
+
+$$
+p(y=1) = \sigma\left(\frac{s_1 - s_2}{T}\right),\quad y \sim \operatorname{Bernoulli}(p)
+$$
+
+(3) margin 기반 pair 샘플링
+너무 쉬운 비교(|s1-s2|가 매우 큼)를 줄이기 위해 다음 범위를 만족하는 pair를 우선 샘플링한다.
+
+$$
+|s_1 - s_2| \in [m_{\min}, m_{\max}]
+$$
+
+3.3 입력 전처리 및 시퀀스 설정
+입력 스케일 문제를 해결하기 위해 다음을 적용하였다.
+- 관측(state)에서 x_com 제거(선호와 무관하고 스케일이 커 모델을 압도할 수 있음)
+- obs/act 모두 Z-score 정규화
+- 시간축 균일 다운샘플(예: T/5로 T≈200)
+
+또한 (P0) 학습과 적응/평가 단계에서 전처리가 일치하도록 공용 모듈을 도입하고, 학습 체크포인트에 전처리 통계를 저장/로드한다(preprocessing_stats.npz).
+
+3.4 모델 아키텍처
+(1) Encoder: context → z
+- TrajectoryEncoder: (B, T, D_sa) → (B, d)  (시간축 집계는 attention pooling 사용)
+- PairEncoder: (e1, e2, y) → h
+- SetEncoder: {h_i}_{i=1..K} → (μ, log σ^2)
+
+(2) Decoder: dot-product reward(핵심 변경)
+posterior collapse를 줄이기 위해 디코더를 오라클 구조에 맞춘 dot-product 형태로 설계하였다.
+
+$$
+\phi(s_t,a_t) \in \mathbb{R}^{d_f},\quad \psi(z) \in \mathbb{R}^{d_f}
+$$
+
+$$
+r(t) = \langle \phi(s_t,a_t), \psi(z)\rangle
+$$
+
+구현 디테일로, ψ(z) 쪽 정규화는 배치 통계로 z 정보가 씻기는 현상을 완화하기 위해 BatchNorm에서 LayerNorm으로 교체하였다(Research Log의 업데이트 반영).
+
+3.5 학습 안정화(정규화/스케줄/규제)
+(1) KL annealing + 상한(kl_max)
+KL 스케줄이 과도해지거나 반대로 인코더가 너무 빠르게 prior로 수렴하는 상황을 완화하기 위해, KL weight에 상한을 둔다.
+
+$$
+\lambda_{\text{KL}} = \min(\lambda_{\text{anneal}}(t),\ \lambda_{\max})
+$$
+
+(2) Free-bits를 per-dimension KL floor로 수정 + raw KL 로깅
+단순 클램프는 collapse를 가릴 수 있으므로, 로깅용 raw KL과 학습용 free-bits 적용 KL을 분리한다.
+
+$$
+\text{KL}_{\text{raw}} = \mathbb{E}\left[\sum_j \text{KL}_j\right]
+$$
+
+$$
+\text{KL}_{\text{freebits}} = \sum_j \max(\mathbb{E}[\text{KL}_j],\ \delta)
+$$
+
+여기서 δ는 차원당 free-bits(nats/dim)이다.
+
+(3) 디코더 규제: feature 추출에 dropout 추가
+디코더가 지름길을 찾는 것을 완화하여 z 경로의 필요성을 높이기 위해 RewardDecoder의 feature_net에 약한 dropout을 추가하였다.
+
+──────────────────────────────────────────────────────────────────────────────
+4. 연구 수행 과정 및 개선 내역(Research Progress)
+──────────────────────────────────────────────────────────────────────────────
+본 장은 RESEARCH_LOG.md에 정리된 변경 사항을 보고서 흐름으로 재구성한 것이다.
+
+4.1 문제 진단: posterior collapse 원인 가설(0단계)
+디코더가 z 없이도 y를 잘 맞추는 구조/데이터 분포가 존재할 경우, 모델은 KL을 줄이는 방향(q(z|c)→p(z))으로 빠르게 수렴할 수 있다. 특히 입력 스케일 편향, sigmoid 포화, KL 항 과대 등이 결합하면 1–2 epoch 내 KL≈0 붕괴가 관찰될 수 있다.
+
+4.2 시뮬레이션 다양성 강화(1단계)
+다양한 궤적을 확보하여 학습 신호를 강화하기 위해, PD(+reference shaping) 제어기(kp/kd/shaping_factor)를 도입하고 범프 높이/폭을 랜덤화하였다. 또한 rms_acceleration을 피처로 추가하여 승차감 관련 신호를 풍부하게 했다.
+
+4.3 settling_time 정의 개선(2단계)
+기존 RMS 규칙은 dt에 의해 양자화되어 값이 고정되는 문제가 있었다. 이를 해결하기 위해 제어이론 기반 정의로 변경하였다.
+- final_value: tail 구간 평균
+- band 조건: |x(t)-final| ≤ max(rel_tol|final|, abs_tol)
+- hold_time 동안 band 유지 시점을 settling time으로 정의
+
+4.4 오라클/데이터셋 리팩토링(3단계)
+K-Means 기반 구성 요소를 제거하고, feature 기반 오라클로 라벨링하는 파이프라인을 확립했다. 또한 유저별 쿼터를 균등 분배하여 각 유저가 동일한 학습 기회를 갖도록 했다. (이전) Group A/B를 명확히 상충(trade-off)하도록 분리하여 데이터 신호를 강화한 경험도 정리되었다.
+
+4.5 입력 스케일 문제 해결(4단계)
+관측에서 x_com 제거, obs/act Z-score 정규화, 시간축 다운샘플(T/5 → T≈200)을 적용하여 특정 차원/스케일이 학습을 지배하는 현상을 완화하였다.
+
+4.6 모델 구조 변경(핵심, 5단계)
+RewardDecoder를 residual 구조에서 dot-product 구조로 전면 변경하였다.
+- feature_dim=16
+- 보상: r(t)=<φ(s_t,a_t), ψ(z)>
+또한 TrajectoryEncoder의 pooling을 max/mean에서 attention pooling으로 변경하여, 궤적 내 중요한 시점의 정보가 더 잘 반영되도록 했다.
+
+4.7 학습 안정화 설정(6단계)
+학습 신호 품질과 안정성을 위해 다음 설정을 적용하였다.
+- reward_scaling=200: sigmoid 입력 (R1-R2) 스케일 조절로 gradient 품질 확보
+- latent_dim=4, context_size=15 (기본값 30→15로 조정)
+- KL annealing: cosine, cycles=4
+- KL weight cap: kl_max=0.5
+- Optimizer: encoder/decoder lr 분리(디코더 lr = 0.2× 인코더 lr)
+- ROC 커브 저장 및 AUC 로깅
+
+4.8 posterior collapse 대응 추가 업데이트(2026-01, 7단계)
+“데이터(신호) → 손실/규제(인센티브) → 평가(가시화)” 순으로 적용하였다.
+
+(7.1) 오라클/데이터 생성 강화(연속 latent 유저 + 확률론 라벨 + margin 샘플링)
+쉬운 pair를 줄여 컨텍스트(z)가 반드시 필요하도록 데이터 분포를 변경하였다.
+
+(7.2) KL weight 상한(kl_max) 도입
+annealer 출력이 과도해지는 것을 방지하기 위해 λ_KL에 상한을 적용하였다.
+
+(7.3) free-bits를 “차원별 KL floor”로 수정 + raw KL 가시화
+학습용 KL과 모니터링용 raw KL을 분리하여, collapse를 더 정확히 진단하도록 했다.
+
+(7.4) 적응(4단계) 사용자 응답을 랜덤 → 그룹 오라클(A/B)로 전환 + 라벨 0/1 혼합
+pair 순서를 (input_traj, implicit_traj)로 고정하고, y∈{0,1}을 실제 값으로 저장하여 PairEncoder가 y 신호를 제대로 활용하도록 개선했다.
+
+(7.5) P0: 학습↔적응/평가 전처리 완전 일치
+학습 데이터 로더는 x_com 제거, 다운샘플, Z-score 정규화를 강제하므로, 적응/평가에서도 동일 전처리를 적용하도록 공용 전처리 모듈을 추가하고 통계 파일을 저장/로드하도록 했다.
+
+(7.6) P3: 적응 성능을 쌍비교 정량지표로 평가(AUC/BCE/Acc)
+적응 전후를 trajectory 평균 보상 ranking이 아니라 pairwise 분류 성능으로 평가하여, “적응된 z가 실제 선호를 더 잘 맞추는지”를 정량적으로 확인하도록 했다.
+
+(7.7) 디코더 규제: feature 추출에 약한 dropout 추가
+디코더가 지름길을 과도하게 찾는 현상을 완화하고 z 경로를 유도한다.
+
+(7.8) 현행 기본 실험 세팅 요약
+- context_size=15
+- kl_max=0.5
+- free_bits=0.15 (nats/dim)
+- decoder_feature_dropout=0.1
+
+──────────────────────────────────────────────────────────────────────────────
+5. 실험 설계 및 평가 지표(Experiments & Metrics)
+──────────────────────────────────────────────────────────────────────────────
+5.1 학습 중 모니터링
+학습 안정성과 collapse 여부를 확인하기 위해 다음을 로깅/시각화한다.
+- loss, accuracy
+- KL divergence: kld_loss(학습용), kld_loss_raw(진단용)
+- KL weight(annealing 결과 및 cap 적용)
+- ROC curve 및 AUC
+
+5.2 적응 성능 평가(P3)
+few-shot 적응의 성능을 pairwise 분류 관점에서 정량화한다.
+- BCE(Binary Cross Entropy)
+- Accuracy
+- ROC-AUC
+
+이때 oracle_group(A/B)을 지정하여 holdout 쌍을 생성하고 지표를 계산한다.
+
+──────────────────────────────────────────────────────────────────────────────
+6. 논의(Discussion)
+──────────────────────────────────────────────────────────────────────────────
+6.1 핵심 인사이트
+본 연구에서 posterior collapse는 단일 원인이라기보다, (i) “쉬운 pair”가 많은 데이터 분포, (ii) z 없이도 y를 맞출 수 있는 디코더 지름길, (iii) 입력 스케일/전처리 불일치, (iv) KL 스케줄/로깅 부재 등이 결합되어 빠르게 발생할 수 있었다. 따라서 해결도 데이터→모델→학습규제→평가 순으로 다각도로 접근하는 것이 효과적이라는 결론을 얻었다.
+
+6.2 데이터 생성의 중요성
+연속 유저 선호 + 확률론 라벨 + margin 샘플링은 “컨텍스트가 필요 없는 전역 평균 전략”을 약화시켜, z의 식별 가능성(identifiability)을 높이는 방향으로 설계되었다. 특히 margin 샘플링은 비교 난이도 분포를 조절하여 학습 신호를 강화하는 핵심 장치였다.
+
+6.3 전처리 일치(P0)의 실무적 중요성
+학습과 적응/평가의 입력 분포가 불일치하면 few-shot 적응 성능 자체가 무의미해질 수 있다. preprocessing_stats.npz 저장/로드를 통해 파이프라인 일관성을 강제한 것은 재현성과 공정한 비교를 위해 필수적이다.
+
+──────────────────────────────────────────────────────────────────────────────
+7. 결론(Conclusion)
+──────────────────────────────────────────────────────────────────────────────
+본 프로젝트는 차량 서스펜션 제어 시뮬레이션에서 선호 비교 데이터 기반으로 개인화된 보상 모델을 학습하는 VAE 프레임워크를 구축하고, posterior collapse를 주요 문제로 진단하여 데이터 생성 강화, dot-product 디코더 구조, KL 제어(kl_max), per-dim free-bits 및 raw KL 가시화, 디코더 dropout, 적응 라벨링/전처리 일치 등의 개선을 단계적으로 적용하였다. 향후에는 z가 실제로 사용되는지에 대한 ablation과, 그룹/유저별 분해 평가를 통해 개인화 성능을 정량적으로 확인할 계획이다.
+
+──────────────────────────────────────────────────────────────────────────────
+8. 향후 연구 계획(Future Work)
+──────────────────────────────────────────────────────────────────────────────
+- z ablation: z=0 고정 vs 정상 z에서 AUC/BCE 차이 확인(“z가 실제로 쓰이는지”)
+- encoder/decoder gradient norm 로깅: 인코더가 실제로 학습 신호를 받는지 확인
+- Group A/B별 성능 분리 평가: 유저별 분별력 및 일반화 확인
+
+──────────────────────────────────────────────────────────────────────────────
+부록 A. 구현/스크립트 메모(참고)
+──────────────────────────────────────────────────────────────────────────────
+- 데이터 생성: scripts/generate_data.py
+- 선호 데이터셋 구축: scripts/build_preference_dataset.py
+- 학습: scripts/train_model.py
+- 적응: scripts/run_interactive_adaptation.py
+- 평가: scripts/evaluate_adaptation.py
+
+

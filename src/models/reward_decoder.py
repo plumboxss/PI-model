@@ -28,7 +28,11 @@ class RewardDecoder(nn.Module):
             nn.LeakyReLU(0.2),
             nn.Linear(hidden_dim, self.feature_dim),
         )
-        self.weight_bn = nn.BatchNorm1d(self.feature_dim)
+        # LayerNorm은 배치 통계를 사용하지 않아, 컨텍스트별 z 정보가 배치/시간축 평균으로 씻기는 문제를 줄인다.
+        # (BN은 여기서 B*T로 펼쳐 적용되어 z별 차이를 약화시킬 수 있음)
+        self.weight_ln = nn.LayerNorm(self.feature_dim)
+        # Learnable gain to recover output scale after normalization
+        self.weight_gain = nn.Parameter(torch.ones(1, 1, self.feature_dim))
 
     def forward(self, obs, act, z):
         """
@@ -44,12 +48,9 @@ class RewardDecoder(nn.Module):
         if z.dim() == 2:
             z = z.unsqueeze(1)  # (B, 1, z_dim) broadcasts over T
         weights = self.weight_net(z)  # (B, T or 1, feature_dim)
-        # BatchNorm expects (N, C); flatten time for normalization
-        if weights.dim() == 3:
-            B, T, F = weights.shape
-            weights = self.weight_bn(weights.reshape(B * T, F)).reshape(B, T, F)
-        else:
-            weights = self.weight_bn(weights)
+        # LayerNorm normalizes over the last dimension (feature_dim)
+        weights = self.weight_ln(weights)
+        weights = weights * self.weight_gain
 
         r = (features * weights).sum(dim=-1, keepdim=True)  # (B, T, 1)
         return r
