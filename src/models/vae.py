@@ -29,6 +29,7 @@ class VAEModel(nn.Module):
         hidden_dim,
         kl_weight=1.0,
         kl_max: float = 0.5,
+        decoder_feature_dropout: float = 0.1,
         learned_prior=False,
         annealer=None,
         reward_scaling=1.0,
@@ -91,7 +92,8 @@ class VAEModel(nn.Module):
             act_dim=act_dim,
             latent_dim=latent_dim,
             hidden_dim=hidden_dim,
-            output_dim=1
+            output_dim=1,
+            feature_dropout=decoder_feature_dropout,
         )
         
         # Learned prior parameters (if enabled)

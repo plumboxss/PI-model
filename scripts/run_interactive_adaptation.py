@@ -14,6 +14,11 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 from src.models.vae import VAEModel
+from src.utils.preprocessing import (
+    PreprocessStats,
+    infer_preprocess_stats_path,
+    preprocess_trajectory,
+)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -158,8 +163,9 @@ def find_implicit_pair(input_traj, input_traj_features, z_current, vae_model,
             act_cand_batch = act_cand.unsqueeze(0)  # (1, min_len, act_dim)
             z_batch = z_current.unsqueeze(0)  # (1, latent_dim)
             
-            r_in = vae_model.decode_reward(obs_in_batch, act_in_batch, z_batch).sum()
-            r_cand = vae_model.decode_reward(obs_cand_batch, act_cand_batch, z_batch).sum()
+            # Match training Bradley–Terry scaling (return divided by reward_scaling)
+            r_in = vae_model.decode_reward(obs_in_batch, act_in_batch, z_batch).sum() / float(vae_model.scaling)
+            r_cand = vae_model.decode_reward(obs_cand_batch, act_cand_batch, z_batch).sum() / float(vae_model.scaling)
             
             # 선호도 확률 계산: P(후보 > 입력 | z)
             prob = torch.sigmoid(r_cand - r_in).item()
@@ -189,11 +195,22 @@ class AdaptationLoop:
         self.device = next(self.vae_model.parameters()).device
         print("Model loaded successfully.")
 
+        # 1-1. Load training-time preprocessing stats to match train distribution (P0)
+        stats_path = args.preprocess_stats_path or infer_preprocess_stats_path(args.vae_model_path)
+        if not os.path.exists(stats_path):
+            raise FileNotFoundError(
+                f"preprocessing_stats.npz not found at '{stats_path}'. "
+                f"Train once after P0 changes (or pass --preprocess_stats_path explicitly)."
+            )
+        self.preprocess_stats = PreprocessStats.from_npz(stats_path)
+        print(f"Loaded preprocessing stats from: {stats_path}")
+
         # 2. 전체 궤적 데이터셋 로드 및 고정 비교 세트 C 생성
         print("Loading trajectory dataset...")
         with open(args.trajectory_dataset_path, 'rb') as f:
             raw_data = pickle.load(f)
 
+        # NOTE: store trajectories in TRAIN-CONSISTENT space (drop x_com, downsample, z-score)
         self.trajectories = []
         self.features_list = []
         # 메모리 효율성을 위해 각 궤적의 길이만 저장
@@ -201,7 +218,12 @@ class AdaptationLoop:
         for i in sorted(raw_data.keys()):
             res = raw_data[i]
             if res.get('features'):
-                self.trajectories.append({'observations': res['state'], 'actions': res['action']})
+                obs_p, act_p = preprocess_trajectory(
+                    np.asarray(res['state']),
+                    np.asarray(res['action']),
+                    self.preprocess_stats,
+                )
+                self.trajectories.append({'observations': obs_p, 'actions': act_p})
                 # IMPORTANT: Keep feature order consistent with training oracle
                 feats = res['features']
                 self.features_list.append(np.array([
@@ -210,7 +232,7 @@ class AdaptationLoop:
                     feats['settling_time'],
                     feats['rms_acceleration'],
                 ], dtype=np.float32))
-                trajectory_lengths.append(len(res['state']))
+                trajectory_lengths.append(len(obs_p))
 
         self.features_matrix = np.array(self.features_list)
         print(f"Loaded {len(self.trajectories)} trajectories.")
@@ -384,6 +406,9 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="어댑테이션 세션을 실행하여 사용자의 잠재 선호 z를 찾습니다.")
     parser.add_argument('--vae_model_path', type=str, required=True, help='사전 훈련된 VAE 모델 경로 (.pt 파일).')
     parser.add_argument('--trajectory_dataset_path', type=str, required=True, help='궤적 데이터셋 경로 (.pkl 파일).')
+    parser.add_argument('--preprocess_stats_path', type=str, default=None,
+                        help="Path to preprocessing_stats.npz saved during training. "
+                             "If omitted, inferred from the vae_model_path directory.")
     parser.add_argument('--output_z_path', type=str, default='data/adapted_z.pt', help='최종 어댑트된 z 벡터 저장 경로.')
     parser.add_argument('--comparison_set_size', type=int, default=1000, help='고정 비교 세트 C의 상태 수.')
     parser.add_argument('--diversity_epsilon', type=float, default=0.1, help='다양한 쌍을 위한 최소 특성 차이.')

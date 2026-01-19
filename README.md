@@ -83,7 +83,7 @@ python scripts/build_preference_dataset.py \
 
 이전 단계에서 생성한 선호도 데이터셋으로 VAE 모델(인코더 `q_ψ`, 보상 디코더 `r_φ`)을 학습시킵니다. 학습 과정은 Weights & Biases를 통해 기록되며, 학습 곡선은 로컬 파일로도 저장됩니다.
 
-- 코드 기본값(현재 `scripts/train_model.py` 기준): `context_size=15`, `annealer_cycles=4`, `trajectory_encoder_type=mlp`, `set_encoder_type=attention`, `reward_scaling=1000`, `free_bits=0.0`, `kl_max=0.5`
+- 코드 기본값(현재 `scripts/train_model.py` 기준): `context_size=15`, `annealer_cycles=4`, `trajectory_encoder_type=mlp`, `set_encoder_type=attention`, `reward_scaling=1000`, `free_bits=0.15`, `kl_max=0.5`, `decoder_feature_dropout=0.1`
 - 실험에서 다른 값을 쓰려면 아래처럼 플래그로 명시하세요(예: `context_size=15`, `annealer_cycles=1`)
 
 ```bash
@@ -103,6 +103,13 @@ python scripts/train_model.py \
 
 학습된 모델(`model.pt` 등)이 `logs/` 디렉토리 내부에 저장되고, 학습 곡선은 `logs/{env}/{model_type}/{comment}/s{seed}/training_curves.png`에 자동 저장됩니다.
 
+**(중요) 전처리 일치(P0): 학습 통계 저장**
+
+학습 시 `ContextQueryDataset` 기준으로 다음 전처리가 적용됩니다: **x_com 제거(9D), 시간축 다운샘플, obs/act Z-score 정규화**.  
+적응/평가 단계도 동일 전처리를 적용하기 위해, 학습 스크립트는 체크포인트 폴더에 아래 파일을 자동 저장합니다:
+
+- `preprocessing_stats.npz`: `obs_mean/std`, `act_mean/std`, `downsample_step`, `obs_dim_used` 등
+
 **(추가) KL weight cap (`--kl_max`)**
 
 KL annealing이 너무 강해지면 KL term이 과도하게 커져 학습이 불안정해지거나, 반대로 인코더가 “안 쓰이는 방향”으로 수렴하는 문제가 생길 수 있습니다. 이를 완화하기 위해 **annealer가 산출한 KL weight에 상한을 두는 옵션**을 제공합니다.
@@ -118,6 +125,7 @@ KL annealing이 너무 강해지면 KL term이 과도하게 커져 학습이 불
 python scripts/run_interactive_adaptation.py \
   --vae_model_path "logs/Suspension-v0/VAE/pretrain_suspension_model_A/s42/best_model.pt" \
   --trajectory_dataset_path "artifacts/A/datasets/raw_trajectories_A.pkl" \
+  --preprocess_stats_path "logs/Suspension-v0/VAE/pretrain_suspension_model_A/s42/preprocessing_stats.npz" \
   --output_z_path "data/adapted_z.pt" \
   --comparison_set_size 1000 \
   --diversity_epsilon 0.1 \
@@ -148,12 +156,14 @@ python scripts/run_interactive_adaptation.py \
 # 기본 평가
 python scripts/evaluate_adaptation.py \
   --vae_model_path "logs/Suspension-v0/VAE/pretrain_suspension_model_A/s42/best_model.pt" \
-  --adapted_z_path "data/adapted_z.pt"
+  --adapted_z_path "data/adapted_z.pt" \
+  --preprocess_stats_path "logs/Suspension-v0/VAE/pretrain_suspension_model_A/s42/preprocessing_stats.npz"
 
 # 궤적 점수 계산 및 시각화 포함
 python scripts/evaluate_adaptation.py \
   --vae_model_path "logs/Suspension-v0/VAE/pretrain_suspension_model_A/s42/best_model.pt" \
   --adapted_z_path "data/adapted_z.pt" \
+  --preprocess_stats_path "logs/Suspension-v0/VAE/pretrain_suspension_model_A/s42/preprocessing_stats.npz" \
   --trajectory_dataset_path "artifacts/A/datasets/raw_trajectories_A.pkl" \
   --visualize
 
@@ -161,9 +171,24 @@ python scripts/evaluate_adaptation.py \
 python scripts/evaluate_adaptation.py \
   --vae_model_path "logs/Suspension-v0/VAE/pretrain_suspension_model_A/s42/best_model.pt" \
   --adapted_z_path "data/adapted_z.pt" \
+  --preprocess_stats_path "logs/Suspension-v0/VAE/pretrain_suspension_model_A/s42/preprocessing_stats.npz" \
   --trajectory_dataset_path "artifacts/A/datasets/raw_trajectories_A.pkl" \
   --before_z_path "data/initial_z.pt" \
   --visualize
+
+**(추가, P3) 쌍비교 성능 평가(AUC/BCE/Acc)**
+
+적응된 `z`가 실제로 선호를 잘 맞추는지 확인하려면, `oracle_group`를 지정해 **오라클 기반 holdout 쌍비교**를 생성하고 AUC/BCE/Acc를 출력할 수 있습니다:
+
+```bash
+python scripts/evaluate_adaptation.py \
+  --vae_model_path "logs/Suspension-v0/VAE/pretrain_suspension_model_A/s42/best_model.pt" \
+  --adapted_z_path "data/adapted_z.pt" \
+  --preprocess_stats_path "logs/Suspension-v0/VAE/pretrain_suspension_model_A/s42/preprocessing_stats.npz" \
+  --trajectory_dataset_path "artifacts/A/datasets/raw_trajectories_A.pkl" \
+  --oracle_group A \
+  --eval_num_pairs 5000
+```
 ```
 
 시각화는 `data/visualizations/`에 저장됩니다. 이 스크립트는 새롭게 정의된 보상 함수를 후속 강화학습이나 추가 분석에 사용할 수 있도록 하는 기반을 제공합니다.

@@ -9,14 +9,16 @@ class RewardDecoder(nn.Module):
     - weight_net: z -> hidden_dim -> feature_dim (tanh bounded)
     """
 
-    def __init__(self, obs_dim, act_dim, latent_dim, hidden_dim=32, output_dim=1):
+    def __init__(self, obs_dim, act_dim, latent_dim, hidden_dim=32, output_dim=1, feature_dropout: float = 0.1):
         super(RewardDecoder, self).__init__()
         self.feature_dim = 16
 
         # Feature Network (phi): (obs+act) -> hidden_dim -> feature_dim
+        drop = nn.Dropout(p=float(feature_dropout)) if feature_dropout and feature_dropout > 0.0 else nn.Identity()
         self.feature_net = nn.Sequential(
             nn.Linear(obs_dim + act_dim, hidden_dim),
             nn.LeakyReLU(0.2),
+            drop,
             nn.Linear(hidden_dim, self.feature_dim),
         )
 

@@ -23,6 +23,7 @@ from src.utils.plot_utils import AnnealedLinearSchedule
 from src.utils.training_utils import EarlyStopper, prefix_metrics, Annealer
 import src.utils.plot_utils as putils
 from src.simulation.env import SingleScenarioEnv
+from src.utils.preprocessing import PreprocessStats
 
 FLAGS_DEF = define_flags_with_default(
     seed=42,
@@ -66,7 +67,8 @@ FLAGS_DEF = define_flags_with_default(
     debug_plots=False,
     plot_observations=False,
     reward_scaling=1000.0,
-    free_bits=0.0,  # KL free bits threshold
+    free_bits=0.15,  # KL floor (nats per latent dimension)
+    decoder_feature_dropout=0.1,  # Weak dropout in RewardDecoder.feature_net
     # biased
     biased_mode="grid",
     comment="", # Add comment flag
@@ -134,6 +136,23 @@ def main(_):
         split_seed=FLAGS.seed  # Use same seed for train/test split reproducibility
     )
 
+    # Save training-time preprocessing stats for strict train/adapt/eval consistency (P0)
+    # This is critical for few-shot adaptation: the encoder/decoder were trained on normalized & downsampled inputs.
+    try:
+        stats = PreprocessStats(
+            obs_dim_used=int(getattr(train_dataset, "obs_mean").shape[0]),
+            downsample_step=int(getattr(train_dataset, "downsample_step")),
+            obs_mean=np.array(getattr(train_dataset, "obs_mean")),
+            obs_std=np.array(getattr(train_dataset, "obs_std")),
+            act_mean=np.array(getattr(train_dataset, "act_mean")),
+            act_std=np.array(getattr(train_dataset, "act_std")),
+        )
+        stats_path = os.path.join(save_dir, "preprocessing_stats.npz")
+        stats.to_npz(stats_path)
+        print(f"✅ Saved preprocessing stats to: {stats_path}")
+    except Exception as e:
+        print(f"⚠️  Warning: Failed to save preprocessing stats (adapt/eval may mismatch training): {e}")
+
     annealer = None
     if FLAGS.use_annealing:
         annealer = Annealer(
@@ -153,6 +172,7 @@ def main(_):
         learned_prior=FLAGS.learned_prior,
         annealer=annealer,
         reward_scaling=FLAGS.reward_scaling,
+        decoder_feature_dropout=FLAGS.decoder_feature_dropout,
         trajectory_encoder_type=FLAGS.trajectory_encoder_type,
         set_encoder_type=FLAGS.set_encoder_type,
         n_heads=FLAGS.n_heads,
