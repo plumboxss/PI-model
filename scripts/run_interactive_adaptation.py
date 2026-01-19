@@ -6,6 +6,7 @@ from tqdm import tqdm
 import os
 import sys
 from functools import partial
+from sklearn.preprocessing import StandardScaler
 
 # 프로젝트 루트를 Python 경로에 추가
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -107,7 +108,7 @@ def find_implicit_pair(input_traj, input_traj_features, z_current, vae_model,
         search_sample_size (int): 검색 효율을 위해 탐색할 궤적의 샘플 크기.
 
     Returns:
-        dict: 찾은 최적의 암시적 궤적.
+        (int, dict): (best_candidate_idx, trajectory dict)
     """
     device = next(vae_model.parameters()).device
     
@@ -172,9 +173,9 @@ def find_implicit_pair(input_traj, input_traj_features, z_current, vae_model,
     if best_candidate_idx == -1:
         print("경고: 충분히 다양한 궤적을 찾을 수 없습니다. 무작위 궤적을 반환합니다.")
         random_idx = np.random.choice(len(trajectories))
-        return trajectories[random_idx]
+        return random_idx, trajectories[random_idx]
         
-    return trajectories[best_candidate_idx]
+    return best_candidate_idx, trajectories[best_candidate_idx]
 
 
 class AdaptationLoop:
@@ -201,11 +202,40 @@ class AdaptationLoop:
             res = raw_data[i]
             if res.get('features'):
                 self.trajectories.append({'observations': res['state'], 'actions': res['action']})
-                self.features_list.append(np.array(list(res['features'].values())))
+                # IMPORTANT: Keep feature order consistent with training oracle
+                feats = res['features']
+                self.features_list.append(np.array([
+                    feats['jerk'],
+                    feats['pitch'],
+                    feats['settling_time'],
+                    feats['rms_acceleration'],
+                ], dtype=np.float32))
                 trajectory_lengths.append(len(res['state']))
 
         self.features_matrix = np.array(self.features_list)
         print(f"Loaded {len(self.trajectories)} trajectories.")
+
+        # 2-1. Build training-style oracle for simulated user feedback (two-group assumption)
+        # Match build_preference_dataset.py feature order: [jerk, pitch, settling_time, rms_acceleration]
+        self._feature_names = ['jerk', 'pitch', 'settling_time', 'rms_acceleration']
+        self._scaler = StandardScaler()
+        self.features_scaled = self._scaler.fit_transform(self.features_matrix)
+
+        # Two prototype user groups (same intent as training-time groups)
+        # Group A: dislikes jerk & rms_acceleration strongly
+        wA = np.array([-1.0, 0.0, 0.0, -1.0], dtype=np.float32)
+        # Group B: prefers pitch & settling_time strongly
+        wB = np.array([0.0, 1.0, 1.0, 0.0], dtype=np.float32)
+        wA = wA / (np.linalg.norm(wA) + 1e-8)
+        wB = wB / (np.linalg.norm(wB) + 1e-8)
+
+        if args.oracle_group.upper() == 'A':
+            self.oracle_w = wA
+        elif args.oracle_group.upper() == 'B':
+            self.oracle_w = wB
+        else:
+            raise ValueError(f"Unsupported oracle_group: {args.oracle_group}. Use 'A' or 'B'.")
+        print(f"Using simulated user oracle group: {args.oracle_group.upper()} (feature space)")
 
         # 메모리 효율적인 방법으로 고정 비교 세트 C 생성
         # 전체를 concatenate하지 않고, 궤적 인덱스와 타임스텝 인덱스를 샘플링
@@ -245,21 +275,31 @@ class AdaptationLoop:
         print(f"Initialized z with shape: {self.z_current.shape}")
 
 
-    def step(self, input_traj, input_traj_features, input_label):
+    def step(self, input_idx):
         """어댑테이션 루프의 한 단계를 수행"""
         print(f"\n--- Step {len(self.context) + 1} ---")
+        input_traj = self.trajectories[input_idx]
+        input_traj_features = self.features_matrix[input_idx]
         
         # 1. 암시적 쌍 찾기 (이제 trajectory_scorer가 필요 없음)
         print("1. Searching for an implicit pair...")
-        implicit_traj = find_implicit_pair(input_traj, input_traj_features, self.z_current, self.vae_model, self.trajectories, self.features_matrix, epsilon=self.args.diversity_epsilon)
+        implicit_idx, implicit_traj = find_implicit_pair(
+            input_traj, input_traj_features, self.z_current, self.vae_model,
+            self.trajectories, self.features_matrix,
+            epsilon=self.args.diversity_epsilon
+        )
         print("Implicit pair found.")
 
+        # 1-1. Simulated user feedback via training-style two-group oracle (pairwise preference)
+        score_in = float(np.dot(self.oracle_w, self.features_scaled[input_idx]))
+        score_imp = float(np.dot(self.oracle_w, self.features_scaled[implicit_idx]))
+        input_label = 1 if score_in >= score_imp else 0  # 1 => input preferred
+        print(f"Simulated user preference (oracle group {self.args.oracle_group.upper()}): input_label={input_label}")
+
         # 2. Update context
-        # input_label=1은 input_traj가 선호됨을 의미
-        if input_label == 1:
-            self.context.append((input_traj, implicit_traj, 1.0))
-        else:
-            self.context.append((implicit_traj, input_traj, 1.0))
+        # Order-fixed pair + true label y in {0,1}
+        # y=1 => (input_traj ≻ implicit_traj), y=0 => (implicit_traj ≻ input_traj)
+        self.context.append((input_traj, implicit_traj, float(input_label)))
         print(f"2. Context updated. Current context size: {len(self.context)}")
 
         # 3. 전체 컨텍스트를 사용하여 z 재추정
@@ -303,19 +343,15 @@ class AdaptationLoop:
     def run(self):
         """어댑테이션 세션을 실행"""
         print("\nStarting interactive adaptation loop.")
-        print("In each step, provide a trajectory and your preference (1 for good, 0 for bad).")
+        print("In each step, a trajectory is selected and a simulated user oracle answers preference based on the chosen user group.")
         
         # 실제 시나리오에서는 외부 입력에 의해 이루어짐.
         # 여기서는 몇 가지 더미 입력을 사용하여 시뮬레이션.
         for i in range(3): # 3 단계의 피드백 시뮬레이션
             # 더미 입력: 데이터셋에서 무작위 궤적 선택
             dummy_input_idx = np.random.randint(len(self.trajectories))
-            dummy_input_traj = self.trajectories[dummy_input_idx]
-            dummy_input_features = self.features_matrix[dummy_input_idx]
-            dummy_label = np.random.choice([0, 1])
-
-            print(f"\nSimulating user input: Trajectory {dummy_input_idx}, Preference: {dummy_label}")
-            self.step(dummy_input_traj, dummy_input_features, dummy_label)
+            print(f"\nSimulating user input: Trajectory {dummy_input_idx} (oracle group {self.args.oracle_group.upper()})")
+            self.step(dummy_input_idx)
         
         print("\nAdaptation finished.")
         print("Final z (mean of distribution):")
@@ -351,6 +387,8 @@ if __name__ == '__main__':
     parser.add_argument('--output_z_path', type=str, default='data/adapted_z.pt', help='최종 어댑트된 z 벡터 저장 경로.')
     parser.add_argument('--comparison_set_size', type=int, default=1000, help='고정 비교 세트 C의 상태 수.')
     parser.add_argument('--diversity_epsilon', type=float, default=0.1, help='다양한 쌍을 위한 최소 특성 차이.')
+    parser.add_argument('--oracle_group', type=str, default='A', choices=['A', 'B', 'a', 'b'],
+                        help="Simulated user group for oracle feedback: 'A' (jerk-hater) or 'B' (pitch-hater).")
     parser.add_argument('--visualize', action='store_true', help='Generate adaptation visualization plots')
 
     args = parser.parse_args()

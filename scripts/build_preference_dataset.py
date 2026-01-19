@@ -134,6 +134,12 @@ def main(args):
     user_weights = np.array(user_weights)
     print(f"Created {num_users} virtual users (random normalized weights in feature space).")
 
+    # Group prototypes for disagreement sampling (mean weight per group)
+    wA = user_weights[:num_group_a].mean(axis=0)
+    wB = user_weights[num_group_a:].mean(axis=0)
+    wA = wA / (np.linalg.norm(wA) + 1e-8)
+    wB = wB / (np.linalg.norm(wB) + 1e-8)
+
     # 5. 선호도 데이터셋 생성
     print(f"Generating {args.num_pairs} preference pairs using feature-weighted oracle...")
     
@@ -154,10 +160,31 @@ def main(args):
     for user_id in tqdm(range(num_users), desc="Generating pairs per user"):
         quota = pairs_per_user + (1 if user_id < remainder else 0)  # 나머지를 앞쪽 유저에게 1개씩 배분
         w = user_weights[user_id]
+        w_other = wB if user_id < num_group_a else wA
 
         for _ in range(quota):
-            # a. 무작위로 두 개의 서로 다른 궤적 선택
-            idx1, idx2 = np.random.choice(num_trajectories, 2, replace=False)
+            # a. 두 개의 서로 다른 궤적 선택
+            # - disagreement_oversample_ratio 비율만큼은 "그룹 A/B가 반대 선택을 할 법한" pair를 우선적으로 생성
+            # - 실패 시(희귀/데이터 적음)에는 랜덤 pair로 fallback
+            want_disagree = (args.disagreement_oversample_ratio > 0) and (np.random.rand() < args.disagreement_oversample_ratio)
+            idx1 = idx2 = None
+            max_tries = max(1, int(args.disagreement_max_tries))
+
+            if want_disagree:
+                for _try in range(max_tries):
+                    i, j = np.random.choice(num_trajectories, 2, replace=False)
+                    s1_u = float(np.dot(w, features_scaled[i]))
+                    s2_u = float(np.dot(w, features_scaled[j]))
+                    s1_o = float(np.dot(w_other, features_scaled[i]))
+                    s2_o = float(np.dot(w_other, features_scaled[j]))
+                    pref_u = (s1_u >= s2_u)
+                    pref_o = (s1_o >= s2_o)
+                    if pref_u != pref_o:
+                        idx1, idx2 = i, j
+                        break
+
+            if idx1 is None or idx2 is None:
+                idx1, idx2 = np.random.choice(num_trajectories, 2, replace=False)
 
             # b. 점수 계산
             score1 = float(np.dot(w, features_scaled[idx1]))
@@ -215,5 +242,9 @@ if __name__ == '__main__':
     parser.add_argument('--output_path', type=str, required=True, help='Path to save the final preference dataset pkl file.')
     parser.add_argument('--num_pairs', type=int, default=20000, help='Number of preference pairs to generate.')
     parser.add_argument('--visualize', action='store_true', help='Generate visualization plots')
+    parser.add_argument('--disagreement_oversample_ratio', type=float, default=0.5,
+                        help='Fraction of generated pairs to bias toward A/B disagreement pairs (0.0 disables).')
+    parser.add_argument('--disagreement_max_tries', type=int, default=50,
+                        help='Max attempts to find a disagreement pair before falling back to random sampling.')
     args = parser.parse_args()
     main(args)

@@ -45,6 +45,7 @@ FLAGS_DEF = define_flags_with_default(
     # VAE
     latent_dim=4,
     kl_weight=1.0,
+    kl_max=0.5,  # Cap for annealed KL weight to mitigate posterior collapse
     learned_prior=False,
     use_annealing=True, # 기본값 변경: False -> True
     annealer_baseline=0.0,
@@ -58,7 +59,7 @@ FLAGS_DEF = define_flags_with_default(
     env='Suspension-v0', # Default env name to avoid flag error
     # Dataset
     dataset_path="",
-    context_size=30,  # Number of context comparisons (K)
+    context_size=15,  # Number of context comparisons (K)
     logging=WandBLogger.get_default_config(),
     # seed=42, # Duplicate seed definition removed
     # plotting
@@ -148,6 +149,7 @@ def main(_):
         latent_dim=FLAGS.latent_dim,
         hidden_dim=FLAGS.hidden_dim,
         kl_weight=FLAGS.kl_weight,
+        kl_max=FLAGS.kl_max,
         learned_prior=FLAGS.learned_prior,
         annealer=annealer,
         reward_scaling=FLAGS.reward_scaling,
@@ -218,6 +220,9 @@ def main(_):
                 context_s1, context_s2, context_y,
                 query_s1, query_s2, query_y
             )
+            # Remove p_hat from logging metrics if present
+            if "p_hat" in batch_metrics:
+                batch_metrics.pop("p_hat")
             loss.backward()
             optimizer.step()
             
@@ -245,11 +250,12 @@ def main(_):
                         query_s1, query_s2, query_y
                     )
 
+                    p_hat = batch_metrics.pop("p_hat", None)
                     for key, val in prefix_metrics(batch_metrics, "eval").items():
                         metrics[key].append(val)
 
-                    if "p_hat" in batch_metrics:
-                        roc_y_score.append(batch_metrics["p_hat"].detach().cpu().numpy())
+                    if p_hat is not None:
+                        roc_y_score.append(p_hat.detach().cpu().numpy())
                         roc_y_true.append(query_y.detach().cpu().numpy())
 
             if FLAGS.debug_plots and "maze2d" in FLAGS.env:
@@ -321,7 +327,9 @@ def main(_):
             # 메트릭 히스토리 준비 (eval 메트릭은 eval_freq에 맞춰 필터링)
             plot_metrics = {}
             for key in ['train/loss', 'eval/loss', 'train/accuracy', 'eval/accuracy', 
-                       'train/kld_loss', 'eval/kld_loss', 'train/kl_weight']:
+                       'train/kld_loss', 'eval/kld_loss',
+                       'train/kld_loss_raw', 'eval/kld_loss_raw',
+                       'train/kl_weight']:
                 if key in metrics_history:
                     plot_metrics[key] = metrics_history[key]
             

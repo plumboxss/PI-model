@@ -269,6 +269,10 @@ def plot_training_curves(metrics_history: Dict[str, List[float]], save_path: Opt
         ax3.plot(epochs, metrics_history['train/kld_loss'], label='Train KL', alpha=0.7)
     if 'eval/kld_loss' in metrics_history:
         ax3.plot(epochs, metrics_history['eval/kld_loss'], label='Eval KL', alpha=0.7)
+    if 'train/kld_loss_raw' in metrics_history:
+        ax3.plot(epochs, metrics_history['train/kld_loss_raw'], label='Train KL (raw)', alpha=0.7, linestyle='--')
+    if 'eval/kld_loss_raw' in metrics_history:
+        ax3.plot(epochs, metrics_history['eval/kld_loss_raw'], label='Eval KL (raw)', alpha=0.7, linestyle='--')
     ax3.set_xlabel('Epoch')
     ax3.set_ylabel('KL Divergence')
     ax3.set_title('KL Divergence Loss')

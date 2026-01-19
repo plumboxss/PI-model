@@ -28,6 +28,7 @@ class VAEModel(nn.Module):
         latent_dim,
         hidden_dim,
         kl_weight=1.0,
+        kl_max: float = 0.5,
         learned_prior=False,
         annealer=None,
         reward_scaling=1.0,
@@ -45,10 +46,12 @@ class VAEModel(nn.Module):
         self.latent_dim = latent_dim
         self.hidden_dim = hidden_dim
         self.kl_weight = kl_weight
+        self.kl_max = kl_max
         self.learned_prior = learned_prior
         self.annealer = annealer
         self.scaling = reward_scaling
-        # Free bits threshold: KL이 이 값 이하일 때는 벌점을 면제해 posterior collapse 완화
+        # Free bits (KL floor) in nats per latent dimension.
+        # When enabled (>0), this discourages posterior collapse by keeping per-dim KL from going to 0.
         self.free_bits = free_bits
         
         # Trajectory embedding dimension (default: hidden_dim)
@@ -210,22 +213,35 @@ class VAEModel(nn.Module):
         if self.learned_prior:
             prior_mean = self.prior_mean
             prior_log_var = self.prior_log_var
-            # KL with learned prior
-            kl_loss_raw = -0.5 * torch.sum(
+            # KL with learned prior (per-sample, per-dimension)
+            # shape: (B, z_dim)
+            kl_per_dim = -0.5 * (
                 1 + log_var - prior_log_var
                 - ((mean - prior_mean).pow(2) + log_var.exp()) / prior_log_var.exp()
-            ) / mean.size(0)
+            )
         else:
-            # Standard KL: KL(q(z|context) || N(0, I))
-            kl_loss_raw = -0.5 * torch.sum(
-                1 + log_var - mean.pow(2) - log_var.exp()
-            ) / mean.size(0)
+            # Standard KL: KL(q(z|context) || N(0, I)) (per-sample, per-dimension)
+            # shape: (B, z_dim)
+            kl_per_dim = -0.5 * (1 + log_var - mean.pow(2) - log_var.exp())
 
-        # Free bits 적용: kl_loss_raw가 임계값 이하이면 벌점을 주지 않는다.
-        kl_loss = torch.clamp(kl_loss_raw - self.free_bits, min=0.0)
+        # Raw KL for logging: mean over batch of sum over dimensions (scalar)
+        kl_loss_raw = kl_per_dim.sum(dim=1).mean()
+
+        # Free-bits (KL floor) per dimension:
+        # Compute per-dimension KL averaged over batch, then clamp each dim to at least free_bits.
+        # This prevents KL from collapsing to ~0 across all dims when the decoder can ignore z.
+        if self.free_bits and self.free_bits > 0.0:
+            kl_per_dim_mean = kl_per_dim.mean(dim=0)  # (z_dim,)
+            kl_per_dim_capped = torch.clamp(kl_per_dim_mean, min=float(self.free_bits))
+            kl_loss = kl_per_dim_capped.sum()
+        else:
+            kl_loss = kl_loss_raw
 
         # Annealed KL weight
         kl_weight = self.annealer.slope() if self.annealer else self.kl_weight
+        # Hard cap to prevent KL term from overpowering and collapsing posterior
+        if self.kl_max is not None:
+            kl_weight = min(float(kl_weight), float(self.kl_max))
         
         # Total loss
         loss = reconstruction_loss + kl_weight * kl_loss
@@ -241,7 +257,9 @@ class VAEModel(nn.Module):
             "kld_loss": kl_loss.item(),
             "kld_loss_raw": kl_loss_raw.item(),
             "accuracy": accuracy.item(),
-            "kl_weight": kl_weight
+            "kl_weight": kl_weight,
+            # For ROC computation in eval (do not log directly)
+            "p_hat": p_hat.detach()
         }
         
         return loss, metrics
